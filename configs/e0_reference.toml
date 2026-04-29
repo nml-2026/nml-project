@@ -8,11 +8,16 @@ model_name = "e0_reference"
 use_velocity = false
 
 [model]
-hidden_dim = 64
+hidden_dim = 32
 num_layers = 1
 dropout = 0.0
 
 [training]
-epochs = 15
-batch_size = 256
-patience = 4
+epochs = 10
+batch_size = 64
+lr = 0.001
+weight_decay = 0.0005
+grad_clip = 10.0
+patience = 20
+train_window_sampling = "random_window_per_sequence"
+val_window_sampling = "random_window_per_sequence"

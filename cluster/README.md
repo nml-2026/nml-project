@@ -27,15 +27,21 @@ tail -f logs/nba-smoke-gpu-<jobid>.out
 
 ## Ray Tune
 
+Quick test run:
+
 ```bash
 NUM_SAMPLES=2 MAX_CONCURRENT_TRIALS=2 EPOCHS=1 MAX_TRAIN_BATCHES=2 MAX_VAL_BATCHES=1 \
   sbatch cluster/izar_tune_single_node.slurm
 ```
 
+Single-config search:
+
 ```bash
 CONFIG=e1_social_ssm NUM_SAMPLES=16 MAX_CONCURRENT_TRIALS=2 \
   sbatch cluster/izar_tune_single_node.slurm
 ```
+
+Candidate ladder:
 
 ```bash
 CONFIGS="e3_dynamic_graph_direct e1_social_ssm e3_graph_ssm_no_social" \
@@ -70,4 +76,4 @@ SEEDS="0" EPOCHS=30 \
 
 ## Notes
 
-The scripts assume the EE-452 GPU allocation and write large run outputs to `/scratch/izar/$USER/nba_forecasting/<jobid>`. Override script defaults with environment variables such as `CONFIG`, `CONFIGS`, `NUM_SAMPLES`, `SEEDS`, `EPOCHS`, and `BATCH_SIZE`.
+The scripts assume the EE-452 GPU allocation and write large run outputs to `/scratch/izar/$USER/nba_forecasting/<jobid>`. Config names are normal full-run defaults; quick tests use runtime overrides such as `EPOCHS`, `MAX_TRAIN_BATCHES`, and `MAX_VAL_BATCHES`. Override script defaults with environment variables such as `CONFIG`, `CONFIGS`, `NUM_SAMPLES`, `SEEDS`, `BATCH_SIZE`, `CHECKPOINT`, `SUMMARY`, and `OUTPUT`.

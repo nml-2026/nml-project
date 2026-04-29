@@ -1,8 +1,0 @@
-extends = "e3_dynamic_graph_gat.toml"
-
-[experiment]
-name = "e3_dynamic_graph_gat_ballhead"
-model_name = "e3_dynamic_graph"
-
-[model]
-separate_ball_head = true

@@ -26,10 +26,10 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-For development, also install `pytest` if it is not already available:
+For development checks, install the optional dev dependencies:
 
 ```bash
-python -m pip install pytest
+python -m pip install -e ".[dev]"
 ```
 
 Run the test suite:
@@ -91,7 +91,7 @@ Generate a Kaggle submission:
 
 ```bash
 PYTHONPATH=src python -m nba_forecasting submit \
-  --checkpoint runs/e3_dynamic_graph/<timestamp>/best.pt \
+  --checkpoint runs/e3_dynamic_graph_direct/<timestamp>/best.pt \
   --output submission.csv
 ```
 
@@ -138,15 +138,27 @@ PYTHONPATH=src python -m nba_forecasting tune \
 ## Experiment Starting Points
 
 - `e0_reference`: reference non-graph baseline
-- `e0_notebook_exact`: notebook-faithful baseline behavior
 - `e1_joint_gru`: stronger non-graph GRU baseline
+- `e1_joint_autoreg_gru`: autoregressive GRU baseline
+- `e1_social_ssm`: state-space baseline with social mixing
 - `e2_static_graph`: static graph model
+- `e2_static_graph_gat`: static graph model with attention message passing
 - `e3_dynamic_graph`: dynamic graph model
 - `e3_dynamic_graph_direct`: direct 12-step graph decoder
 - `e3_graph_ssm`: graph plus state-space-model blocks
+- `e3_graph_ssm_no_social`: graph plus state-space-model blocks without social SSM layers
 - `e4_no_dynamic_edges`, `e4_no_semantic_flags`, `e4_no_velocity`: ablations
 
 Use `configs/base.toml` as the common configuration reference.
+Configs are full-run defaults. For quick tests, keep the same config name and pass runtime overrides such as `--epochs`, `training.max_train_batches`, and `training.max_val_batches`.
+
+## Development Checks
+
+GitHub Actions runs linting, formatting checks, shell syntax checks, and tests on pull requests. Local pre-commit hooks are optional after installing the dev dependencies:
+
+```bash
+pre-commit install
+```
 
 ## Workflow Notes
 

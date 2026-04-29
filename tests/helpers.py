@@ -5,7 +5,6 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-
 TEAM_VALUES = torch.tensor([0, -1, -1, -1, -1, -1, 1, 1, 1, 1, 1], dtype=torch.float32)
 IS_PLAYER = (TEAM_VALUES != 0).float()
 
@@ -36,10 +35,7 @@ def write_synthetic_dataset(root: Path, train_lengths: list[int], test_count: in
     pd.DataFrame({"id": list(range(test_count))}).to_csv(data_dir / "test.csv", index=False)
 
     submission_columns = ["id"] + [
-        f"entity_{entity_idx}_time_{time_idx}_{axis}"
-        for time_idx in range(12)
-        for entity_idx in range(11)
-        for axis in ("x", "y")
+        f"entity_{entity_idx}_time_{time_idx}_{axis}" for time_idx in range(12) for entity_idx in range(11) for axis in ("x", "y")
     ]
     pd.DataFrame([[seq_id] + [0.0] * (len(submission_columns) - 1) for seq_id in range(test_count)], columns=submission_columns).to_csv(
         data_dir / "sample_submission.csv",

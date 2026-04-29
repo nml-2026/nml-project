@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import copy
+import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
-import copy
-import json
 
 try:  # Python 3.11+
     import tomllib
@@ -51,7 +51,7 @@ class ExperimentSection:
     checkpoint_metric: str = "ade"
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> "ExperimentSection":
+    def from_mapping(cls, data: dict[str, Any]) -> ExperimentSection:
         return cls(**data)
 
 
@@ -60,7 +60,7 @@ class FeatureSection:
     use_velocity: bool = True
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> "FeatureSection":
+    def from_mapping(cls, data: dict[str, Any]) -> FeatureSection:
         return cls(**data)
 
 
@@ -87,7 +87,7 @@ class ModelSection:
     ssm_conv_kernel: int = 3
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> "ModelSection":
+    def from_mapping(cls, data: dict[str, Any]) -> ModelSection:
         return cls(**data)
 
 
@@ -111,7 +111,7 @@ class TrainingSection:
     val_window_sampling: str = "all_windows"
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> "TrainingSection":
+    def from_mapping(cls, data: dict[str, Any]) -> TrainingSection:
         return cls(**data)
 
 
@@ -120,7 +120,7 @@ class EvaluationSection:
     num_examples: int = 3
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> "EvaluationSection":
+    def from_mapping(cls, data: dict[str, Any]) -> EvaluationSection:
         return cls(**data)
 
 
@@ -137,7 +137,7 @@ class RunConfig:
         return 6 if self.features.use_velocity else 4
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "RunConfig":
+    def from_dict(cls, data: dict[str, Any]) -> RunConfig:
         return cls(
             experiment=ExperimentSection.from_mapping(data["experiment"]),
             features=FeatureSection.from_mapping(data.get("features", {})),
@@ -209,9 +209,7 @@ def parse_override_value(raw_value: str) -> Any:
             return caster(raw_value)
         except ValueError:
             continue
-    if (raw_value.startswith('"') and raw_value.endswith('"')) or (
-        raw_value.startswith("'") and raw_value.endswith("'")
-    ):
+    if (raw_value.startswith('"') and raw_value.endswith('"')) or (raw_value.startswith("'") and raw_value.endswith("'")):
         return raw_value[1:-1]
     return raw_value
 

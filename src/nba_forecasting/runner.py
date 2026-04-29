@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-import csv
 import copy
+import csv
 import json
 import os
 import random
@@ -12,6 +9,9 @@ import shutil
 import statistics
 import sys
 import traceback
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 import torch
 from torch.optim.swa_utils import AveragedModel
@@ -214,8 +214,7 @@ def _build_dataloaders(
             )
             return dataset, loader
         raise ValueError(
-            f"Unknown window sampling strategy {sampling_strategy!r}. "
-            "Expected one of {'all_windows', 'random_window_per_sequence'}."
+            f"Unknown window sampling strategy {sampling_strategy!r}. Expected one of {{'all_windows', 'random_window_per_sequence'}}."
         )
 
     train_dataset, train_loader = build_split_loader(
@@ -802,8 +801,7 @@ def repeat_trials_experiment(
     aggregate: dict[str, float] = {}
     for split_name in required_splits:
         split_rows = [
-            {metric: float(row[f"{split_name}_{metric}"]) for metric in METRIC_KEYS if f"{split_name}_{metric}" in row}
-            for row in completed
+            {metric: float(row[f"{split_name}_{metric}"]) for metric in METRIC_KEYS if f"{split_name}_{metric}" in row} for row in completed
         ]
         aggregate.update(_aggregate_split_metrics(split_rows, split_name))
     ranking_key = f"val_{config.experiment.checkpoint_metric}_mean"
@@ -886,8 +884,7 @@ def cross_validate_experiment(
     aggregate: dict[str, float] = {}
     for split_name in required_splits:
         split_rows = [
-            {metric: float(row[f"{split_name}_{metric}"]) for metric in METRIC_KEYS if f"{split_name}_{metric}" in row}
-            for row in completed
+            {metric: float(row[f"{split_name}_{metric}"]) for metric in METRIC_KEYS if f"{split_name}_{metric}" in row} for row in completed
         ]
         aggregate.update(_aggregate_split_metrics(split_rows, split_name))
     ranking_key = f"val_{config.experiment.checkpoint_metric}_mean"

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable
 import json
 import random
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset, Sampler
@@ -28,7 +28,7 @@ class Normalizer:
         }
 
     @classmethod
-    def from_state_dict(cls, state: dict[str, list[float]]) -> "Normalizer":
+    def from_state_dict(cls, state: dict[str, list[float]]) -> Normalizer:
         return cls(
             mu=torch.tensor(state["mu"], dtype=torch.float32),
             sigma=torch.tensor(state["sigma"], dtype=torch.float32),
@@ -79,8 +79,8 @@ def freeze_sequence_split(train_dir: str | Path, split_path: str | Path, seed: i
     n_val = int(n_total * 0.1)
     split = {
         "train": sorted(ids[:n_train]),
-        "val": sorted(ids[n_train:n_train + n_val]),
-        "holdout": sorted(ids[n_train + n_val:]),
+        "val": sorted(ids[n_train : n_train + n_val]),
+        "holdout": sorted(ids[n_train + n_val :]),
     }
     _validate_split(split, available_ids)
     split_file.write_text(json.dumps(split, indent=2, sort_keys=True))
@@ -129,7 +129,7 @@ def freeze_kfold_sequence_splits(
     fold_paths: list[Path] = []
     cursor = 0
     for fold_idx, fold_size in enumerate(fold_sizes):
-        val_ids = sorted(shuffled_ids[cursor:cursor + fold_size])
+        val_ids = sorted(shuffled_ids[cursor : cursor + fold_size])
         cursor += fold_size
         train_ids = sorted(seq_id for seq_id in pool_ids if seq_id not in set(val_ids))
         split = {
@@ -166,10 +166,10 @@ def compute_normalizer(sequence_paths: Iterable[Path]) -> Normalizer:
         xy = seq[:, :, :2]
         total_count += xy.shape[0] * xy.shape[1]
         total_sum += xy.sum(dim=(0, 1), dtype=torch.float64)
-        total_squared_sum += (xy ** 2).sum(dim=(0, 1), dtype=torch.float64)
+        total_squared_sum += (xy**2).sum(dim=(0, 1), dtype=torch.float64)
 
     mu = total_sum / total_count
-    var = total_squared_sum / total_count - (mu ** 2)
+    var = total_squared_sum / total_count - (mu**2)
     sigma = torch.sqrt(var.clamp_min(1e-6))
     return Normalizer(mu=mu.float(), sigma=sigma.float())
 

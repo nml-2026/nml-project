@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
-import torch
 import pandas as pd
+import torch
 from torch.utils.data import DataLoader
 
 from nba_forecasting.config import RunConfig, apply_overrides, parse_override_value
@@ -20,9 +20,14 @@ from nba_forecasting.data import (
 )
 from nba_forecasting.metrics import normalized_mse_loss
 from nba_forecasting.models import build_model
-from nba_forecasting.runner import cross_validate_experiment, repeat_trials_experiment, submit_checkpoint, train_experiment, train_many_experiments
-
-from tests.helpers import TEAM_VALUES, IS_PLAYER, write_synthetic_dataset
+from nba_forecasting.runner import (
+    cross_validate_experiment,
+    repeat_trials_experiment,
+    submit_checkpoint,
+    train_experiment,
+    train_many_experiments,
+)
+from tests.helpers import IS_PLAYER, TEAM_VALUES, write_synthetic_dataset
 
 
 def make_config(
@@ -70,25 +75,25 @@ def make_config(
                 "ssm_conv_kernel": 3,
                 "separate_ball_head": False,
             },
-                "training": {
-                    "epochs": 2,
-                    "batch_size": 4,
-                    "lr": 0.01,
-                    "weight_decay": 0.0,
+            "training": {
+                "epochs": 2,
+                "batch_size": 4,
+                "lr": 0.01,
+                "weight_decay": 0.0,
                 "grad_clip": 1.0,
                 "num_workers": 0,
                 "patience": 2,
                 "log_every": 10,
                 "teacher_forcing_prob": 0.0,
-                    "scheduled_sampling_final_prob": 0.0,
-                    "ema_decay": 0.0,
-                    "swa_start_pct": 0.0,
-                    "train_window_sampling": "all_windows",
-                    "val_window_sampling": "all_windows",
-                },
-                "evaluation": {"num_examples": 2},
-            }
-        )
+                "scheduled_sampling_final_prob": 0.0,
+                "ema_decay": 0.0,
+                "swa_start_pct": 0.0,
+                "train_window_sampling": "all_windows",
+                "val_window_sampling": "all_windows",
+            },
+            "evaluation": {"num_examples": 2},
+        }
+    )
 
 
 def make_context(batch_size: int, use_velocity: bool) -> torch.Tensor:
@@ -133,7 +138,6 @@ class ModelAndRunnerTests(unittest.TestCase):
             use_entity_embeddings,
         ) in [
             ("e0_reference", False, True, True, "autoregressive", False, False),
-            ("e0_notebook_exact", False, True, True, "autoregressive", False, False),
             ("e1_joint_gru", True, True, True, "autoregressive", False, False),
             ("e1_joint_autoreg_gru", True, True, True, "autoregressive", False, False),
             ("e1_social_ssm", True, True, True, "autoregressive", False, True),
@@ -228,8 +232,8 @@ name = "joint_gru_notebook_sampling"
 model_name = "e1_joint_gru"
 seed = 0
 data_dir = "{data_dir}"
-output_root = "{root / 'runs'}"
-split_path = "{root / 'artifacts' / 'splits' / 'default.json'}"
+output_root = "{root / "runs"}"
+split_path = "{root / "artifacts" / "splits" / "default.json"}"
 device = "cpu"
 context_size = 8
 horizon_size = 12
@@ -316,8 +320,8 @@ num_examples = 1
 [experiment]
 seed = 0
 data_dir = "{data_dir}"
-output_root = "{root / 'runs'}"
-split_path = "{root / 'artifacts' / 'splits' / 'default.json'}"
+output_root = "{root / "runs"}"
+split_path = "{root / "artifacts" / "splits" / "default.json"}"
 device = "cpu"
 context_size = 8
 horizon_size = 12
@@ -358,12 +362,8 @@ swa_start_pct = 0.0
 [evaluation]
 num_examples = 1
 """
-            config_a.write_text(
-                base.replace('[experiment]', '[experiment]\nname = "job_a"\nmodel_name = "e0_reference"', 1)
-            )
-            config_b.write_text(
-                base.replace('[experiment]', '[experiment]\nname = "job_b"\nmodel_name = "e1_joint_gru"', 1)
-            )
+            config_a.write_text(base.replace("[experiment]", '[experiment]\nname = "job_a"\nmodel_name = "e1_joint_autoreg_gru"', 1))
+            config_b.write_text(base.replace("[experiment]", '[experiment]\nname = "job_b"\nmodel_name = "e1_joint_gru"', 1))
             batch_dir = train_many_experiments(
                 configs=[str(config_a), str(config_b)],
                 seeds=[0, 1],
@@ -461,8 +461,8 @@ name = "direct"
 model_name = "e3_dynamic_graph"
 seed = 0
 data_dir = "{data_dir}"
-output_root = "{root / 'runs'}"
-split_path = "{root / 'artifacts' / 'splits' / 'default.json'}"
+output_root = "{root / "runs"}"
+split_path = "{root / "artifacts" / "splits" / "default.json"}"
 device = "cpu"
 context_size = 8
 horizon_size = 12
@@ -523,8 +523,8 @@ name = "repeatable"
 model_name = "e1_joint_gru"
 seed = 3
 data_dir = "{data_dir}"
-output_root = "{root / 'runs'}"
-split_path = "{root / 'artifacts' / 'splits' / 'default.json'}"
+output_root = "{root / "runs"}"
+split_path = "{root / "artifacts" / "splits" / "default.json"}"
 device = "cpu"
 context_size = 8
 horizon_size = 12
@@ -586,8 +586,8 @@ name = "cv_model"
 model_name = "e1_joint_gru"
 seed = 0
 data_dir = "{data_dir}"
-output_root = "{root / 'runs'}"
-split_path = "{root / 'artifacts' / 'splits' / 'default.json'}"
+output_root = "{root / "runs"}"
+split_path = "{root / "artifacts" / "splits" / "default.json"}"
 device = "cpu"
 context_size = 8
 horizon_size = 12

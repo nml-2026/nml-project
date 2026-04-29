@@ -19,8 +19,26 @@ dependencies = [
   "tqdm>=4.62",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pre-commit>=4.0",
+  "pytest>=8.0",
+  "ruff>=0.15.11",
+]
+
 [project.scripts]
 nba-forecast = "nba_forecasting.cli:main"
+
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nba_forecasting"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

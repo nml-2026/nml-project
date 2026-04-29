@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime
-from pathlib import Path
 import json
 import re
 import shutil
 import tempfile
+from datetime import datetime
+from pathlib import Path
 
 from .config import load_config, parse_override_value, resolve_config_paths
 from .runner import evaluate_checkpoint, train_experiment
-
 
 SEARCH_PATTERN = re.compile(r"^(?P<kind>[a-z_]+)\((?P<body>.*)\)$")
 
@@ -24,9 +23,9 @@ def _require_ray():
         from ray import train as ray_train
         from ray import tune
         from ray.tune import Checkpoint
+        from ray.tune.schedulers import ASHAScheduler
         from ray.tune.search import ConcurrencyLimiter
         from ray.tune.search.optuna import OptunaSearch
-        from ray.tune.schedulers import ASHAScheduler
     except ImportError as exc:  # pragma: no cover - exercised only when Ray is missing
         raise RuntimeError(
             "Ray Tune is required for hyperparameter tuning. Install it with "
@@ -113,7 +112,9 @@ def run_ray_tune_search(
     search_space, search_kinds = _build_search_space(search_specs, tune)
     metric_name = f"val_{config.experiment.checkpoint_metric}"
     if search_algorithm == "optuna" and "grid" in search_kinds:
-        raise ValueError("OptunaSearch does not support grid(...) search spaces. Use choice(...), randint(...), uniform(...), or loguniform(...).")
+        raise ValueError(
+            "OptunaSearch does not support grid(...) search spaces. Use choice(...), randint(...), uniform(...), or loguniform(...)."
+        )
 
     def trainable(sampled_config: dict[str, object]) -> None:
         trial_overrides = {}

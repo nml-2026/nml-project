@@ -1,9 +1,0 @@
-extends = "e1_social_ssm.toml"
-
-[experiment]
-name = "e1_social_ssm_overnight"
-
-[training]
-epochs = 64
-patience = 16
-lr = 0.0004

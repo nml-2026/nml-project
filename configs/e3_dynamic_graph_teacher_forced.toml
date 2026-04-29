@@ -1,9 +1,0 @@
-extends = "e3_dynamic_graph_wide.toml"
-
-[experiment]
-name = "e3_dynamic_graph_teacher_forced"
-model_name = "e3_dynamic_graph"
-
-[training]
-teacher_forcing_prob = 1.0
-scheduled_sampling_final_prob = 0.0

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
 import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -15,7 +15,6 @@ from nba_forecasting.data import (
     freeze_sequence_split,
 )
 from nba_forecasting.metrics import compute_raw_metrics, normalized_mse_loss
-
 from tests.helpers import write_synthetic_dataset
 
 
@@ -83,7 +82,7 @@ class DataAndMetricsTests(unittest.TestCase):
         metrics = compute_raw_metrics(prediction, target)
         self.assertAlmostEqual(metrics["mse"], 2.5, places=6)
         self.assertAlmostEqual(metrics["ade"], 5.0, places=6)
-        self.assertAlmostEqual(metrics["rmse"], 2.5 ** 0.5, places=6)
+        self.assertAlmostEqual(metrics["rmse"], 2.5**0.5, places=6)
         self.assertAlmostEqual(float(normalized_mse_loss(prediction, target).item()), 2.5, places=6)
 
 

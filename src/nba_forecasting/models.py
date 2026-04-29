@@ -5,7 +5,6 @@ from torch import nn
 
 from .config import RunConfig
 
-
 NUM_RELATION_TYPES = 3
 
 
@@ -188,8 +187,7 @@ class MessagePassingLayer(nn.Module):
         self.num_relations = num_relations
         if num_relations > 0:
             self.relation_mlps = nn.ModuleList(
-                MLP(2 * node_dim + edge_dim, message_dim, message_dim, dropout=dropout)
-                for _ in range(num_relations)
+                MLP(2 * node_dim + edge_dim, message_dim, message_dim, dropout=dropout) for _ in range(num_relations)
             )
         else:
             self.message_mlp = MLP(2 * node_dim + edge_dim, message_dim, message_dim, dropout=dropout)
@@ -255,7 +253,7 @@ class EdgeAwareAttentionLayer(nn.Module):
             nn.Linear(node_dim, node_dim),
         )
         self.norm = nn.LayerNorm(node_dim)
-        self.scale = message_dim ** 0.5
+        self.scale = message_dim**0.5
         self.num_relations = num_relations
         if num_relations > 0:
             self.relation_key = nn.Embedding(num_relations + 1, message_dim)
@@ -301,9 +299,7 @@ def _make_message_layers(
     num_relations: int = 0,
 ) -> nn.ModuleList:
     layer_cls = MessagePassingLayer if message_passing_type == "mpnn" else EdgeAwareAttentionLayer
-    return nn.ModuleList(
-        layer_cls(node_dim, edge_dim, message_dim, dropout, num_relations=num_relations) for _ in range(num_layers)
-    )
+    return nn.ModuleList(layer_cls(node_dim, edge_dim, message_dim, dropout, num_relations=num_relations) for _ in range(num_layers))
 
 
 class TypeConditionedDeltaHead(nn.Module):
@@ -446,11 +442,7 @@ class ReferenceGRUModel(nn.Module):
                     raise RuntimeError("Autoregressive rollout requires a previous prediction.")
                 parts = [previous_xy]
                 if feature_dim == 6:
-                    velocity = (
-                        torch.zeros_like(previous_xy)
-                        if previous_previous_xy is None
-                        else previous_xy - previous_previous_xy
-                    )
+                    velocity = torch.zeros_like(previous_xy) if previous_previous_xy is None else previous_xy - previous_previous_xy
                     parts.append(velocity)
                 parts.append(static)
                 current_input = torch.cat(parts, dim=-1)
@@ -627,21 +619,25 @@ class HorizonQueryDecoder(nn.Module):
 
     def forward(self, hidden_state: torch.Tensor, static: torch.Tensor, last_positions: torch.Tensor) -> torch.Tensor:
         batch_size, num_entities, hidden_dim = hidden_state.shape
-        horizon_tokens = self.horizon_embed(
-            torch.arange(self.horizon_size, device=hidden_state.device)
-        ).view(1, self.horizon_size, 1, hidden_dim)
+        horizon_tokens = self.horizon_embed(torch.arange(self.horizon_size, device=hidden_state.device)).view(
+            1, self.horizon_size, 1, hidden_dim
+        )
         entity_tokens = hidden_state.unsqueeze(1).expand(-1, self.horizon_size, -1, -1)
-        query = self.query_proj(
-            torch.cat([entity_tokens, horizon_tokens.expand(batch_size, -1, num_entities, -1)], dim=-1)
-        ).reshape(batch_size, self.horizon_size * num_entities, hidden_dim)
+        query = self.query_proj(torch.cat([entity_tokens, horizon_tokens.expand(batch_size, -1, num_entities, -1)], dim=-1)).reshape(
+            batch_size, self.horizon_size * num_entities, hidden_dim
+        )
         attn_out, _ = self.cross_attn(query, hidden_state, hidden_state, need_weights=False)
         decoded = self.norm1(query + attn_out)
         decoded = self.norm2(decoded + self.ffn(decoded))
         decoded = decoded.reshape(batch_size * self.horizon_size, num_entities, hidden_dim)
-        repeated_static = static.unsqueeze(1).expand(-1, self.horizon_size, -1, -1).reshape(
-            batch_size * self.horizon_size,
-            num_entities,
-            2,
+        repeated_static = (
+            static.unsqueeze(1)
+            .expand(-1, self.horizon_size, -1, -1)
+            .reshape(
+                batch_size * self.horizon_size,
+                num_entities,
+                2,
+            )
         )
         deltas = self.delta_head(decoded, repeated_static).reshape(batch_size, self.horizon_size, num_entities, 2)
         return last_positions.unsqueeze(1) + torch.cumsum(deltas, dim=1)
@@ -668,21 +664,23 @@ class HorizonSSMDecoder(nn.Module):
 
     def forward(self, hidden_state: torch.Tensor, static: torch.Tensor, last_positions: torch.Tensor) -> torch.Tensor:
         batch_size, num_entities, hidden_dim = hidden_state.shape
-        horizon_tokens = self.horizon_embed(
-            torch.arange(self.horizon_size, device=hidden_state.device)
-        ).view(1, self.horizon_size, 1, hidden_dim)
-        entity_tokens = hidden_state.unsqueeze(1).expand(-1, self.horizon_size, -1, -1)
-        sequence = self.input_proj(
-            torch.cat([entity_tokens, horizon_tokens.expand(batch_size, -1, num_entities, -1)], dim=-1)
+        horizon_tokens = self.horizon_embed(torch.arange(self.horizon_size, device=hidden_state.device)).view(
+            1, self.horizon_size, 1, hidden_dim
         )
+        entity_tokens = hidden_state.unsqueeze(1).expand(-1, self.horizon_size, -1, -1)
+        sequence = self.input_proj(torch.cat([entity_tokens, horizon_tokens.expand(batch_size, -1, num_entities, -1)], dim=-1))
         sequence = sequence.permute(0, 2, 1, 3).reshape(batch_size * num_entities, self.horizon_size, hidden_dim)
         for layer in self.layers:
             sequence = layer(sequence)
         decoded = sequence.reshape(batch_size, num_entities, self.horizon_size, hidden_dim).permute(0, 2, 1, 3)
-        repeated_static = static.unsqueeze(1).expand(-1, self.horizon_size, -1, -1).reshape(
-            batch_size * self.horizon_size,
-            num_entities,
-            2,
+        repeated_static = (
+            static.unsqueeze(1)
+            .expand(-1, self.horizon_size, -1, -1)
+            .reshape(
+                batch_size * self.horizon_size,
+                num_entities,
+                2,
+            )
         )
         deltas = self.delta_head(
             decoded.reshape(batch_size * self.horizon_size, num_entities, hidden_dim),
@@ -719,13 +717,11 @@ class SocialSSMForecastModel(nn.Module):
             self.team_embedding = nn.Embedding(3, entity_embedding_dim)
         self.node_proj = nn.Linear(node_input_dim, hidden_dim)
         self.temporal_layers = nn.ModuleList(
-            CycleSSMBlock(hidden_dim=hidden_dim, conv_kernel=ssm_conv_kernel, dropout=dropout)
-            for _ in range(temporal_ssm_layers)
+            CycleSSMBlock(hidden_dim=hidden_dim, conv_kernel=ssm_conv_kernel, dropout=dropout) for _ in range(temporal_ssm_layers)
         )
         self.social_edge_proj = nn.Linear(edge_dim, hidden_dim)
         self.social_layers = nn.ModuleList(
-            CycleSSMBlock(hidden_dim=hidden_dim, conv_kernel=ssm_conv_kernel, dropout=dropout)
-            for _ in range(social_ssm_layers)
+            CycleSSMBlock(hidden_dim=hidden_dim, conv_kernel=ssm_conv_kernel, dropout=dropout) for _ in range(social_ssm_layers)
         )
         self.fusion_gate = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -1193,13 +1189,11 @@ class GraphSSMDirectModel(DynamicGraphBackbone):
         )
         edge_dim = 5 if use_semantic_flags else 3
         self.temporal_layers = nn.ModuleList(
-            CycleSSMBlock(hidden_dim=hidden_dim, conv_kernel=ssm_conv_kernel, dropout=dropout)
-            for _ in range(temporal_ssm_layers)
+            CycleSSMBlock(hidden_dim=hidden_dim, conv_kernel=ssm_conv_kernel, dropout=dropout) for _ in range(temporal_ssm_layers)
         )
         self.social_edge_proj = nn.Linear(edge_dim, hidden_dim)
         self.social_layers = nn.ModuleList(
-            CycleSSMBlock(hidden_dim=hidden_dim, conv_kernel=ssm_conv_kernel, dropout=dropout)
-            for _ in range(social_ssm_layers)
+            CycleSSMBlock(hidden_dim=hidden_dim, conv_kernel=ssm_conv_kernel, dropout=dropout) for _ in range(social_ssm_layers)
         )
         self.fusion_gate = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -1265,12 +1259,6 @@ def build_model(config: RunConfig) -> nn.Module:
         "dropout": model_cfg.dropout,
     }
     if model_name == "e0_reference":
-        return ReferenceGRUModel(
-            input_dim=config.input_dim,
-            hidden_dim=model_cfg.hidden_dim,
-            horizon_size=experiment.horizon_size,
-        )
-    if model_name == "e0_notebook_exact":
         return NotebookExactModel(
             input_dim=config.input_dim,
             hidden_dim=model_cfg.hidden_dim,
