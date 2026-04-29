@@ -1,0 +1,8 @@
+extends = "e3_dynamic_graph_wide.toml"
+
+[experiment]
+name = "e3_dynamic_graph_ballhead"
+model_name = "e3_dynamic_graph"
+
+[model]
+separate_ball_head = true

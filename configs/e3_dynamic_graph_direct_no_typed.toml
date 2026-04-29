@@ -1,0 +1,10 @@
+extends = "e3_dynamic_graph_direct.toml"
+
+[experiment]
+name = "e3_dynamic_graph_direct_no_typed"
+model_name = "e3_dynamic_graph"
+
+[model]
+use_relation_types = false
+use_entity_embeddings = false
+separate_ball_head = false

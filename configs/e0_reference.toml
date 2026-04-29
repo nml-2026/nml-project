@@ -1,0 +1,18 @@
+extends = "base.toml"
+
+[experiment]
+name = "e0_reference"
+model_name = "e0_reference"
+
+[features]
+use_velocity = false
+
+[model]
+hidden_dim = 64
+num_layers = 1
+dropout = 0.0
+
+[training]
+epochs = 15
+batch_size = 256
+patience = 4

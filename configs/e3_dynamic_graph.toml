@@ -1,0 +1,19 @@
+extends = "base.toml"
+
+[experiment]
+name = "e3_dynamic_graph"
+model_name = "e3_dynamic_graph"
+
+[model]
+hidden_dim = 128
+message_dim = 128
+num_layers = 2
+dropout = 0.1
+k_neighbors = 3
+use_semantic_flags = true
+dynamic_edges = true
+
+[training]
+epochs = 30
+batch_size = 128
+patience = 7

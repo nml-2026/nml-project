@@ -1,0 +1,29 @@
+extends = "base.toml"
+
+[experiment]
+name = "e3_graph_ssm"
+model_name = "e3_graph_ssm"
+
+[model]
+hidden_dim = 160
+message_dim = 160
+num_layers = 2
+dropout = 0.1
+k_neighbors = 3
+use_semantic_flags = true
+dynamic_edges = true
+message_passing_type = "mpnn"
+separate_ball_head = true
+use_relation_types = true
+use_entity_embeddings = true
+entity_embedding_dim = 16
+temporal_ssm_layers = 2
+social_ssm_layers = 1
+decoder_ssm_layers = 2
+ssm_conv_kernel = 3
+
+[training]
+epochs = 30
+batch_size = 192
+lr = 0.0005
+patience = 7

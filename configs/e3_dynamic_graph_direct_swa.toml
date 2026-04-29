@@ -1,0 +1,8 @@
+extends = "e3_dynamic_graph_direct.toml"
+
+[experiment]
+name = "e3_dynamic_graph_direct_swa"
+model_name = "e3_dynamic_graph"
+
+[training]
+swa_start_pct = 0.75

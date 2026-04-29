@@ -1,0 +1,8 @@
+extends = "e3_graph_ssm.toml"
+
+[experiment]
+name = "e3_graph_ssm_no_social"
+model_name = "e3_graph_ssm"
+
+[model]
+social_ssm_layers = 0

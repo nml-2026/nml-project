@@ -1,0 +1,13 @@
+extends = "e2_static_graph.toml"
+
+[experiment]
+name = "e2_static_graph_gat"
+model_name = "e2_static_graph"
+
+[model]
+message_passing_type = "gat"
+
+[training]
+epochs = 20
+batch_size = 256
+lr = 0.0007

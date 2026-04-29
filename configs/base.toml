@@ -1,0 +1,56 @@
+[experiment]
+name = "base"
+model_name = "e1_joint_gru"
+seed = 0
+data_dir = "data"
+output_root = "runs"
+split_path = "artifacts/splits/default_split.json"
+device = "auto"
+context_size = 8
+horizon_size = 12
+num_entities = 11
+checkpoint_metric = "ade"
+
+[features]
+use_velocity = true
+
+[model]
+hidden_dim = 128
+message_dim = 128
+num_layers = 2
+dropout = 0.1
+k_neighbors = 3
+use_semantic_flags = true
+dynamic_edges = true
+message_passing_type = "mpnn"
+separate_ball_head = false
+use_relation_types = false
+use_entity_embeddings = false
+entity_embedding_dim = 16
+decoder_type = "autoregressive"
+direct_decoder_heads = 4
+temporal_ssm_layers = 2
+social_ssm_layers = 1
+decoder_ssm_layers = 2
+ssm_conv_kernel = 3
+
+[training]
+epochs = 20
+batch_size = 128
+lr = 0.001
+weight_decay = 0.0001
+grad_clip = 1.0
+num_workers = 0
+patience = 5
+log_every = 50
+teacher_forcing_prob = 0.0
+scheduled_sampling_final_prob = 0.0
+ema_decay = 0.0
+swa_start_pct = 0.0
+max_train_batches = 0
+max_val_batches = 0
+train_window_sampling = "all_windows"
+val_window_sampling = "all_windows"
+
+[evaluation]
+num_examples = 3

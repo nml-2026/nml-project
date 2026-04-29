@@ -1,0 +1,18 @@
+extends = "e3_dynamic_graph.toml"
+
+[experiment]
+name = "e3_dynamic_graph_wide"
+model_name = "e3_dynamic_graph"
+
+[model]
+hidden_dim = 192
+message_dim = 192
+num_layers = 3
+k_neighbors = 5
+dropout = 0.1
+
+[training]
+epochs = 35
+batch_size = 256
+lr = 0.0007
+patience = 8

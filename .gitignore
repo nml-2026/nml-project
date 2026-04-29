@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project outputs and local datasets
+runs/
+logs/
+artifacts/splits/
+artifacts/cv/
+data/*.csv
+data/train/
+data/test/
+.mplconfig/
+.DS_Store

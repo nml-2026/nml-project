@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nba-trajectory-forecasting"
+version = "0.1.0"
+description = "Script-first pipeline for the EPFL Network Machine Learning NBA trajectory project."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "matplotlib>=3.10",
+  "numpy>=1.26,<2",
+  "optuna>=3.6",
+  "pandas>=2.2",
+  "ray[tune]>=2.52.1",
+  "tomli>=2.0; python_version < '3.11'",
+  "torch>=2.0",
+  "tqdm>=4.62",
+]
+
+[project.scripts]
+nba-forecast = "nba_forecasting.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
