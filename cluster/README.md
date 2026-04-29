@@ -13,6 +13,7 @@ Then log in to Izar and create the module-backed virtual environment:
 ```bash
 ssh izar
 cd ~/nml-project
+mkdir -p logs
 bash cluster/izar_create_module_venv.sh
 ```
 
@@ -41,6 +42,23 @@ CONFIGS="e3_dynamic_graph_direct e1_social_ssm e3_graph_ssm_no_social" \
 NUM_SAMPLES=8 MAX_CONCURRENT_TRIALS=2 \
   sbatch cluster/izar_tune_model_ladder.slurm
 ```
+
+## Kaggle Submission
+
+Generate a submission from the latest Ray Tune result for a config:
+
+```bash
+CONFIG=e3_dynamic_graph_direct sbatch cluster/izar_submit.slurm
+```
+
+Or generate from a specific checkpoint:
+
+```bash
+CHECKPOINT=/scratch/izar/$USER/nba_forecasting/<jobid>/ray_tune/<config>/<timestamp>/trial_runs/<run>/best.pt \
+  sbatch cluster/izar_submit.slurm
+```
+
+Download the generated CSV from the path printed in the job log.
 
 ## Batch Training
 
