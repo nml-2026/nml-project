@@ -8,6 +8,7 @@ Given 8 observed time steps for 10 NBA players plus the ball, the code predicts 
 
 - `src/nba_forecasting/`: package code for data loading, models, training, evaluation, plotting, and submission generation
 - `configs/`: TOML experiment configs for baselines, graph models, and ablations
+- `docs/`: project notes for model families and experiment planning
 - `tests/`: smoke and regression tests
 - `cluster/`: starter scripts for running experiments on SCITAS Izar
 - `references/`: assignment brief and project reference material

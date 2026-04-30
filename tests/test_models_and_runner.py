@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from nba_forecasting.config import RunConfig, apply_overrides, parse_override_value
+from nba_forecasting.config import RunConfig, apply_overrides, load_config, parse_override_value
 from nba_forecasting.data import (
     NotebookRandomWindowSampler,
     NotebookSequenceDataset,
@@ -126,6 +126,15 @@ class ModelAndRunnerTests(unittest.TestCase):
         self.assertEqual(parse_override_value("13"), 13)
         self.assertEqual(parse_override_value("1.25"), 1.25)
         self.assertEqual(parse_override_value("mps"), "mps")
+
+    def test_public_configs_load_and_build_models(self) -> None:
+        config_paths = sorted((Path(__file__).parents[1] / "configs").glob("*.toml"))
+        self.assertGreater(len(config_paths), 0)
+        for config_path in config_paths:
+            with self.subTest(config=config_path.name):
+                config, _ = load_config(config_path)
+                model = build_model(config)
+                self.assertIsInstance(model, torch.nn.Module)
 
     def test_all_models_return_expected_shapes(self) -> None:
         for (
