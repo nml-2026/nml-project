@@ -118,6 +118,23 @@ class SocialSSMForecastModel(nn.Module):
         dynamic = node_features[:, :, :-2]
         return torch.cat([dynamic, static, self._entity_embedding(static)], dim=-1)
 
+    def _fuse_temporal_social(self, temporal_state: torch.Tensor, positions: torch.Tensor, static: torch.Tensor) -> torch.Tensor:
+        if len(self.social_layers) == 0:
+            return temporal_state
+        batch_size, num_entities, hidden_dim = temporal_state.shape
+        social = _distance_sorted_social_inputs(
+            temporal_state,
+            positions=positions,
+            static=static,
+            edge_proj=self.social_edge_proj,
+            use_semantic_flags=self.use_semantic_flags,
+        ).reshape(batch_size * num_entities, num_entities - 1, hidden_dim)
+        for layer in self.social_layers:
+            social = layer(social)
+        social_state = social.mean(dim=1).reshape(batch_size, num_entities, hidden_dim)
+        gate = torch.sigmoid(self.fusion_gate(torch.cat([temporal_state, social_state], dim=-1)))
+        return self.fusion_norm(gate * temporal_state + (1.0 - gate) * social_state)
+
     def forward(
         self,
         context: torch.Tensor,
@@ -138,18 +155,7 @@ class SocialSSMForecastModel(nn.Module):
         for layer in self.temporal_layers:
             temporal = layer(temporal)
         temporal_state = temporal[:, -1].reshape(batch_size, num_entities, -1)
-        social = _distance_sorted_social_inputs(
-            temporal_state,
-            positions=context[:, -1, :, :2],
-            static=static,
-            edge_proj=self.social_edge_proj,
-            use_semantic_flags=self.use_semantic_flags,
-        ).reshape(batch_size * num_entities, num_entities, -1)
-        for layer in self.social_layers:
-            social = layer(social)
-        social_state = social[:, 0].reshape(batch_size, num_entities, -1)
-        gate = torch.sigmoid(self.fusion_gate(torch.cat([temporal_state, social_state], dim=-1)))
-        fused = self.fusion_norm(gate * temporal_state + (1.0 - gate) * social_state)
+        fused = self._fuse_temporal_social(temporal_state, context[:, -1, :, :2], static)
         return self.decoder(fused, static, context[:, -1, :, :2])
 
 
@@ -219,6 +225,23 @@ class GraphSSMDirectModel(DynamicGraphBackbone):
             separate_ball_head=separate_ball_head,
         )
 
+    def _fuse_temporal_social(self, temporal_state: torch.Tensor, positions: torch.Tensor, static: torch.Tensor) -> torch.Tensor:
+        if len(self.social_layers) == 0:
+            return temporal_state
+        batch_size, num_entities, hidden_dim = temporal_state.shape
+        social = _distance_sorted_social_inputs(
+            temporal_state,
+            positions=positions,
+            static=static,
+            edge_proj=self.social_edge_proj,
+            use_semantic_flags=self.use_semantic_flags,
+        ).reshape(batch_size * num_entities, num_entities - 1, hidden_dim)
+        for layer in self.social_layers:
+            social = layer(social)
+        social_state = social.mean(dim=1).reshape(batch_size, num_entities, hidden_dim)
+        gate = torch.sigmoid(self.fusion_gate(torch.cat([temporal_state, social_state], dim=-1)))
+        return self.fusion_norm(gate * temporal_state + (1.0 - gate) * social_state)
+
     def forward(
         self,
         context: torch.Tensor,
@@ -238,16 +261,5 @@ class GraphSSMDirectModel(DynamicGraphBackbone):
         for layer in self.temporal_layers:
             temporal = layer(temporal)
         temporal_state = temporal[:, -1].reshape(batch_size, num_entities, -1)
-        social = _distance_sorted_social_inputs(
-            temporal_state,
-            positions=context[:, -1, :, :2],
-            static=static,
-            edge_proj=self.social_edge_proj,
-            use_semantic_flags=self.use_semantic_flags,
-        ).reshape(batch_size * num_entities, num_entities, -1)
-        for layer in self.social_layers:
-            social = layer(social)
-        social_state = social[:, 0].reshape(batch_size, num_entities, -1)
-        gate = torch.sigmoid(self.fusion_gate(torch.cat([temporal_state, social_state], dim=-1)))
-        fused = self.fusion_norm(gate * temporal_state + (1.0 - gate) * social_state)
+        fused = self._fuse_temporal_social(temporal_state, context[:, -1, :, :2], static)
         return self.decoder(fused, static, context[:, -1, :, :2])

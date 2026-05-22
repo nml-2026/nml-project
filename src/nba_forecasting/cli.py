@@ -4,15 +4,58 @@ import argparse
 from pathlib import Path
 
 from .config import parse_override_value
-from .ray_tune import run_ray_tune_search
-from .runner import (
-    cross_validate_experiment,
-    evaluate_checkpoint,
-    repeat_trials_experiment,
-    submit_checkpoint,
-    train_experiment,
-    train_many_experiments,
+from .ray_tune import SEARCH_PROFILES, resolve_search_specs
+from .results import (
+    collect_result_rows,
+    collect_runtime_rows,
+    default_cluster_results_root,
+    export_best_config,
+    format_results_csv,
+    format_results_markdown,
+    format_runtime_estimate_markdown,
 )
+
+
+def train_experiment(*args, **kwargs):
+    from .runner import train_experiment as impl
+
+    return impl(*args, **kwargs)
+
+
+def train_many_experiments(*args, **kwargs):
+    from .runner import train_many_experiments as impl
+
+    return impl(*args, **kwargs)
+
+
+def repeat_trials_experiment(*args, **kwargs):
+    from .runner import repeat_trials_experiment as impl
+
+    return impl(*args, **kwargs)
+
+
+def cross_validate_experiment(*args, **kwargs):
+    from .runner import cross_validate_experiment as impl
+
+    return impl(*args, **kwargs)
+
+
+def run_ray_tune_search(*args, **kwargs):
+    from .ray_tune import run_ray_tune_search as impl
+
+    return impl(*args, **kwargs)
+
+
+def evaluate_checkpoint(*args, **kwargs):
+    from .runner import evaluate_checkpoint as impl
+
+    return impl(*args, **kwargs)
+
+
+def submit_checkpoint(*args, **kwargs):
+    from .runner import submit_checkpoint as impl
+
+    return impl(*args, **kwargs)
 
 
 def _add_runtime_override_args(parser: argparse.ArgumentParser) -> None:
@@ -124,9 +167,15 @@ def build_parser() -> argparse.ArgumentParser:
     tune_parser.add_argument(
         "--search",
         action="append",
-        required=True,
+        default=[],
         metavar="PATH=EXPR",
         help="Ray Tune search expression such as model.hidden_dim=choice(128,192,256) or training.lr=loguniform(1e-4,5e-3).",
+    )
+    tune_parser.add_argument(
+        "--search-profile",
+        choices=["none", *sorted(SEARCH_PROFILES)],
+        default="none",
+        help="Named Ray Tune search profile. Explicit --search specs are appended and can override profile paths.",
     )
     tune_parser.add_argument("--num-samples", type=int, default=8, help="Number of Ray Tune samples to draw.")
     tune_parser.add_argument("--search-alg", choices=["optuna"], default="optuna", help="Search algorithm to use with Ray Tune.")
@@ -158,6 +207,30 @@ def build_parser() -> argparse.ArgumentParser:
     submit_parser.add_argument("--checkpoint", required=True, help="Path to best.pt")
     submit_parser.add_argument("--output", default=None, help="Optional CSV output path.")
     submit_parser.add_argument("--device", default="auto", help="Device for submission: auto, cpu, mps, cuda.")
+
+    results_parser = subparsers.add_parser("summarize-results", help="Rank Ray Tune and batch results under a run root.")
+    results_parser.add_argument(
+        "--root",
+        default=None,
+        help=f"Run root to scan. Defaults to {default_cluster_results_root()}.",
+    )
+    results_parser.add_argument("--format", choices=["csv", "markdown"], default="csv", help="Output table format.")
+    results_parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of rows.")
+    results_parser.add_argument("--output", default=None, help="Optional output file path. Defaults to stdout.")
+
+    runtime_parser = subparsers.add_parser("estimate-runtime", help="Estimate full Ray Tune runtime from completed summary files.")
+    runtime_parser.add_argument(
+        "--root",
+        default=None,
+        help=f"Run root to scan. Defaults to {default_cluster_results_root()}.",
+    )
+    runtime_parser.add_argument("--target-samples", type=int, required=True, help="Target Ray Tune samples per config.")
+    runtime_parser.add_argument("--target-epochs", type=int, required=True, help="Target training epochs per trial.")
+    runtime_parser.add_argument("--output", default=None, help="Optional Markdown output path. Defaults to stdout.")
+
+    export_parser = subparsers.add_parser("export-best-config", help="Export the best Ray Tune trial config as reusable TOML.")
+    export_parser.add_argument("--summary", required=True, help="Path to ray_tune_summary.json.")
+    export_parser.add_argument("--output", default=None, help="Output TOML path. Defaults to best_config.toml next to the summary.")
 
     return parser
 
@@ -219,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
             overrides["experiment.name"] = f"{Path(args.config).stem}_{args.name_suffix}"
         tune_dir = run_ray_tune_search(
             config_arg=args.config,
-            search_specs=args.search,
+            search_specs=resolve_search_specs(args.search_profile, args.search),
             overrides=overrides,
             num_samples=args.num_samples,
             scheduler_name=args.scheduler,
@@ -240,6 +313,32 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "submit":
         submission_path = submit_checkpoint(args.checkpoint, args.output, device_arg=args.device)
         print(f"Submission written to {submission_path}")
+        return 0
+    if args.command == "summarize-results":
+        rows = collect_result_rows(args.root)
+        if args.limit is not None:
+            rows = rows[: args.limit]
+        output = format_results_csv(rows) if args.format == "csv" else format_results_markdown(rows)
+        if args.output:
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.output).write_text(output)
+            print(f"Result summary written to {args.output}")
+        else:
+            print(output, end="")
+        return 0
+    if args.command == "estimate-runtime":
+        rows = collect_runtime_rows(args.root or default_cluster_results_root())
+        output = format_runtime_estimate_markdown(rows, args.target_samples, args.target_epochs)
+        if args.output:
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.output).write_text(output)
+            print(f"Runtime estimate written to {args.output}")
+        else:
+            print(output, end="")
+        return 0
+    if args.command == "export-best-config":
+        output_path = export_best_config(args.summary, args.output)
+        print(f"Best config written to {output_path}")
         return 0
     parser.error(f"Unknown command {args.command!r}")
     return 2

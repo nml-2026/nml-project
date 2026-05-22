@@ -1,0 +1,8 @@
+extends = "e5_graph_transformer.toml"
+
+[experiment]
+name = "e5_graph_transformer_shuffled_graph"
+model_name = "e5_graph_transformer"
+
+[model]
+graph_ablation_mode = "shuffled_graph"

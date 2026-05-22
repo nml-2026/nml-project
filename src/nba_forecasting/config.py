@@ -85,6 +85,12 @@ class ModelSection:
     social_ssm_layers: int = 1
     decoder_ssm_layers: int = 2
     ssm_conv_kernel: int = 3
+    transformer_heads: int = 4
+    spatial_layers: int = 2
+    temporal_layers: int = 2
+    decoder_layers: int = 2
+    transformer_ffn_multiplier: float = 2.0
+    graph_ablation_mode: str = "normal"
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> ModelSection:

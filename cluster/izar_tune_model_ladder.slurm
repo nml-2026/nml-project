@@ -16,10 +16,14 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/nml-project}"
 RUN_ROOT="${RUN_ROOT:-/scratch/izar/$USER/nba_forecasting/$SLURM_JOB_ID}"
 CONFIGS="${CONFIGS:-e3_dynamic_graph_direct e1_social_ssm e3_graph_ssm_no_social}"
+SEARCH_PROFILE="${SEARCH_PROFILE:-basic}"
 NUM_SAMPLES="${NUM_SAMPLES:-8}"
 MAX_CONCURRENT_TRIALS="${MAX_CONCURRENT_TRIALS:-2}"
 CPUS_PER_TRIAL="${CPUS_PER_TRIAL:-8}"
 GPUS_PER_TRIAL="${GPUS_PER_TRIAL:-1}"
+PRINT_RUNTIME_ESTIMATE="${PRINT_RUNTIME_ESTIMATE:-1}"
+ESTIMATE_TARGET_SAMPLES="${ESTIMATE_TARGET_SAMPLES:-8}"
+ESTIMATE_TARGET_EPOCHS="${ESTIMATE_TARGET_EPOCHS:-35}"
 EPOCHS="${EPOCHS:-}"
 MAX_TRAIN_BATCHES="${MAX_TRAIN_BATCHES:-}"
 MAX_VAL_BATCHES="${MAX_VAL_BATCHES:-}"
@@ -54,9 +58,7 @@ for config in "${CONFIG_ARGS[@]}"; do
     --device "$DEVICE" \
     --output-root "$RUN_ROOT" \
     "${EXTRA_ARGS[@]}" \
-    --search 'model.hidden_dim=choice(128,192,256)' \
-    --search 'training.lr=loguniform(1e-4,5e-3)' \
-    --search 'model.dropout=uniform(0.0,0.2)' \
+    --search-profile "$SEARCH_PROFILE" \
     --num-samples "$NUM_SAMPLES" \
     --search-alg optuna \
     --scheduler asha \
@@ -64,4 +66,10 @@ for config in "${CONFIG_ARGS[@]}"; do
     --gpus-per-trial "$GPUS_PER_TRIAL" \
     --max-concurrent-trials "$MAX_CONCURRENT_TRIALS"
   echo "=== Ray Tune complete: ${config} ==="
+  if [[ "$PRINT_RUNTIME_ESTIMATE" == "1" ]]; then
+    python -m nba_forecasting estimate-runtime \
+      --root "$RUN_ROOT" \
+      --target-samples "$ESTIMATE_TARGET_SAMPLES" \
+      --target-epochs "$ESTIMATE_TARGET_EPOCHS"
+  fi
 done

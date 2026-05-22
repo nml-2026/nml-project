@@ -82,10 +82,17 @@ def _distance_sorted_social_inputs(
     static: torch.Tensor,
     edge_proj: nn.Module,
     use_semantic_flags: bool,
+    include_self: bool = False,
 ) -> torch.Tensor:
     batch_size, num_entities, hidden_dim = node_state.shape
     edge_feat = _edge_features(positions, static, use_semantic_flags)
-    order = torch.cdist(positions, positions).argsort(dim=-1)
+    distances = torch.cdist(positions, positions)
+    if not include_self:
+        eye = torch.eye(num_entities, device=positions.device, dtype=torch.bool).unsqueeze(0)
+        distances = distances.masked_fill(eye, float("inf"))
+    order = distances.argsort(dim=-1)
+    if not include_self:
+        order = order[:, :, : max(num_entities - 1, 1)]
     gather_node = order.unsqueeze(-1).expand(-1, -1, -1, hidden_dim)
     gather_edge = order.unsqueeze(-1).expand(-1, -1, -1, edge_feat.shape[-1])
     sorted_nodes = torch.gather(node_state.unsqueeze(1).expand(-1, num_entities, -1, -1), 2, gather_node)
@@ -208,6 +215,61 @@ class EdgeAwareAttentionLayer(nn.Module):
         return self.norm(node_state + updated)
 
 
+class MessagePassingSSMLayer(nn.Module):
+    def __init__(
+        self,
+        node_dim: int,
+        edge_dim: int,
+        message_dim: int,
+        dropout: float,
+        num_relations: int = 0,
+    ) -> None:
+        super().__init__()
+        self.message_mlp = MLP(2 * node_dim + edge_dim, message_dim, message_dim, dropout=dropout)
+        self.gate = nn.Sequential(
+            nn.Linear(node_dim + message_dim, node_dim),
+            nn.Sigmoid(),
+        )
+        self.candidate = nn.Sequential(
+            nn.Linear(message_dim, node_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(node_dim, node_dim),
+        )
+        self.update = nn.Sequential(
+            nn.Linear(node_dim * 2, node_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(node_dim, node_dim),
+        )
+        self.norm = nn.LayerNorm(node_dim)
+        self.num_relations = num_relations
+        if num_relations > 0:
+            self.relation_embedding = nn.Embedding(num_relations + 1, message_dim)
+
+    def forward(
+        self,
+        node_state: torch.Tensor,
+        edge_feat: torch.Tensor,
+        mask: torch.Tensor,
+        relation_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        node_i = node_state.unsqueeze(2).expand(-1, -1, node_state.shape[1], -1)
+        node_j = node_state.unsqueeze(1).expand(-1, node_state.shape[1], -1, -1)
+        message_input = torch.cat([node_i, node_j, edge_feat], dim=-1)
+        messages = self.message_mlp(message_input)
+        if self.num_relations > 0 and relation_ids is not None:
+            messages = messages + self.relation_embedding(relation_ids)
+        messages = messages * mask.unsqueeze(-1)
+        denom = mask.sum(dim=-1, keepdim=True).clamp_min(1).to(node_state.dtype)
+        aggregated = messages.sum(dim=2) / denom
+        gate = self.gate(torch.cat([node_state, aggregated], dim=-1))
+        candidate = self.candidate(aggregated)
+        mixed = gate * node_state + (1.0 - gate) * candidate
+        updated = self.update(torch.cat([node_state, mixed], dim=-1))
+        return self.norm(node_state + updated)
+
+
 def _make_message_layers(
     message_passing_type: str,
     node_dim: int,
@@ -217,5 +279,13 @@ def _make_message_layers(
     dropout: float,
     num_relations: int = 0,
 ) -> nn.ModuleList:
-    layer_cls = MessagePassingLayer if message_passing_type == "mpnn" else EdgeAwareAttentionLayer
+    layer_map = {
+        "mpnn": MessagePassingLayer,
+        "gat": EdgeAwareAttentionLayer,
+        "mp_ssm": MessagePassingSSMLayer,
+    }
+    if message_passing_type not in layer_map:
+        available = ", ".join(sorted(layer_map))
+        raise ValueError(f"Unknown message_passing_type {message_passing_type!r}. Available values: {available}.")
+    layer_cls = layer_map[message_passing_type]
     return nn.ModuleList(layer_cls(node_dim, edge_dim, message_dim, dropout, num_relations=num_relations) for _ in range(num_layers))

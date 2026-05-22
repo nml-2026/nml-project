@@ -5,6 +5,7 @@ from torch import nn
 from ..config import RunConfig
 from .baselines import JointAutoregressiveGRUModel, JointGRUForecastModel, NotebookExactModel
 from .graph import DynamicGraphAutoregressiveModel, DynamicGraphDirectModel, StaticGraphDirectModel
+from .graph_transformer import GraphTransformerForecastModel
 from .ssm import GraphSSMDirectModel, SocialSSMForecastModel
 
 
@@ -102,5 +103,27 @@ def build_model(config: RunConfig) -> nn.Module:
             social_ssm_layers=model_cfg.social_ssm_layers,
             decoder_ssm_layers=model_cfg.decoder_ssm_layers,
             ssm_conv_kernel=model_cfg.ssm_conv_kernel,
+        )
+    if model_name == "e5_graph_transformer":
+        return GraphTransformerForecastModel(
+            input_dim=config.input_dim,
+            num_entities=experiment.num_entities,
+            context_size=experiment.context_size,
+            horizon_size=experiment.horizon_size,
+            hidden_dim=model_cfg.hidden_dim,
+            dropout=model_cfg.dropout,
+            k_neighbors=model_cfg.k_neighbors,
+            use_semantic_flags=model_cfg.use_semantic_flags,
+            dynamic_edges=model_cfg.dynamic_edges,
+            separate_ball_head=model_cfg.separate_ball_head,
+            use_entity_embeddings=model_cfg.use_entity_embeddings,
+            entity_embedding_dim=model_cfg.entity_embedding_dim,
+            edge_radius=model_cfg.edge_radius,
+            transformer_heads=model_cfg.transformer_heads,
+            spatial_layers=model_cfg.spatial_layers,
+            temporal_layers=model_cfg.temporal_layers,
+            decoder_layers=model_cfg.decoder_layers,
+            transformer_ffn_multiplier=model_cfg.transformer_ffn_multiplier,
+            graph_ablation_mode=model_cfg.graph_ablation_mode,
         )
     raise ValueError(f"Unknown model name {model_name!r}.")

@@ -15,10 +15,15 @@ ENV/
 .mplconfig/
 logs/
 runs/
+data/
+/*.md
 artifacts/splits/
 artifacts/cv/
 
 references/
+presentation_work/
+.github/
+.pre-commit-config.yaml
 
 *.egg-info/
 build/

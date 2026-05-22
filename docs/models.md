@@ -66,15 +66,41 @@ Direct-decoder dynamic graph model. It uses the same dynamic graph encoder idea,
 
 The config also enables relation types, entity embeddings, a separate ball head, wider hidden dimensions, and larger k-neighborhoods.
 
+### `e3_dynamic_graph_attention`
+
+Same direct-decoder setup as `e3_dynamic_graph_direct`, but uses edge-aware attention for graph message passing. This is the lightweight graph-attention baseline over the 11 entities.
+
+### `e3_dynamic_graph_mp_ssm`
+
+Same direct-decoder setup as `e3_dynamic_graph_direct`, but uses an SSM-inspired message-passing layer. It keeps the standard graph interface while replacing plain mean aggregation with a gated node/message update.
+
 ## Graph + SSM Models
 
 ### `e3_graph_ssm`
 
-Combines graph encoding with SSM-style temporal and social processing. First, each observed step is graph-encoded. Then temporal SSM layers process each entity's sequence of graph states. A social SSM block mixes entities based on distance-sorted social inputs. A gated fusion combines temporal and social states, and an SSM decoder predicts all horizon steps directly.
+Combines graph encoding with SSM-style temporal and social processing. First, each observed step is graph-encoded. Then temporal SSM layers process each entity's sequence of graph states. A social SSM block mixes entities based on egocentric distance-sorted social inputs that exclude the target entity itself. A gated fusion combines temporal and social states, and an SSM decoder predicts all horizon steps directly.
 
 ### `e3_graph_ssm_no_social`
 
-Removes the learned social SSM layers from `e3_graph_ssm`. This tests whether the social SSM component helps beyond graph encoding plus temporal SSM dynamics.
+Removes the learned social SSM layers from `e3_graph_ssm`. This is a true no-social path: the graph-temporal state bypasses the social branch before decoding.
+
+## Graph Transformer
+
+### `e5_graph_transformer`
+
+Spatiotemporal Transformer candidate with an explicit graph component. Each encoder stage alternates graph-masked spatial attention over entities with temporal attention over the observed context for each entity. Spatial attention is restricted by the dynamic graph and receives learned edge bias from relative position, distance, and semantic edge features.
+
+The decoder builds horizon/entity query tokens and applies graph attention again before predicting cumulative position deltas. This means graph structure affects both context encoding and horizon decoding.
+
+### `e5_graph_transformer_no_graph`
+
+Matched ablation for `e5_graph_transformer`. It keeps the same model capacity but replaces graph masks with dense entity attention and removes edge bias. This is not final-model eligible.
+
+### `e5_graph_transformer_shuffled_graph`
+
+Matched ablation for `e5_graph_transformer`. It keeps sparse graph-style masking but corrupts neighbor identity. This is not final-model eligible.
+
+Treat `e5_graph_transformer` as a serious final candidate only if matched-budget validation runs beat both ablations.
 
 ## Current Ablation Configs
 
@@ -94,7 +120,7 @@ Extends `e3_dynamic_graph`, but removes velocity features. This tests whether ex
 
 The code supports several knobs that are not all exposed as separate configs:
 
-- `message_passing_type`: MPNN vs GAT-style graph layers.
+- `message_passing_type`: MPNN, GAT-style attention, or SSM-inspired graph message passing.
 - `decoder_type`: autoregressive vs direct horizon decoding for dynamic graph models.
 - `use_relation_types`: typed same-team / opponent / ball relations.
 - `use_entity_embeddings`: learned embeddings for player/ball and team identity.
@@ -102,6 +128,8 @@ The code supports several knobs that are not all exposed as separate configs:
 - `k_neighbors`: graph sparsity for dynamic edges.
 - `edge_radius`: optional distance cutoff.
 - `temporal_ssm_layers`, `social_ssm_layers`, `decoder_ssm_layers`: where SSM capacity matters.
+- `transformer_heads`, `spatial_layers`, `temporal_layers`, `decoder_layers`, `transformer_ffn_multiplier`: graph Transformer capacity.
+- `graph_ablation_mode`: normal, no-graph, or shuffled-graph behavior for graph Transformer ablations.
 - `teacher_forcing_prob` / `scheduled_sampling_final_prob`: rollout training strategy for autoregressive models.
 
 ## Main Comparisons

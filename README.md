@@ -8,7 +8,7 @@ Given 8 observed time steps for 10 NBA players plus the ball, the code predicts 
 
 - `src/nba_forecasting/`: package code for data loading, models, training, evaluation, plotting, and submission generation
 - `configs/`: TOML experiment configs for baselines, graph models, and ablations
-- `docs/`: project notes for model families and experiment planning
+- `docs/`: project notes for model families, paper-guided changes, and experiment planning
 - `tests/`: smoke and regression tests
 - `cluster/`: starter scripts for running experiments on SCITAS Izar
 - `references/`: assignment brief and project reference material
@@ -64,13 +64,17 @@ Each `.pt` sequence has shape `L x 11 x 4`, with features:
 
 The first 8 time steps are the context window, and the target horizon is the next 12 time steps.
 
-When copying the repository to Izar with `rsync`, use `.rsyncignore` from the repository root:
+When copying code to Izar with `rsync`, use `.rsyncignore` from the repository root:
 
 ```bash
 rsync -av --delete --exclude-from=.rsyncignore ./ izar:~/nml-project/
 ```
 
-This copies the local `data/*.csv`, `data/train/*.pt`, and `data/test/*.pt` files, while excluding git metadata, references, logs, runs, caches, and build artifacts.
+This excludes local data, git metadata, references, logs, runs, caches, and build artifacts. If the dataset needs to be refreshed on Izar, copy it explicitly:
+
+```bash
+rsync -av data/ izar:~/nml-project/data/
+```
 
 ## Common Commands
 
@@ -127,13 +131,24 @@ Run Ray Tune with Optuna search:
 PYTHONPATH=src python -m nba_forecasting tune \
   --config e3_dynamic_graph_direct \
   --device auto \
-  --search model.hidden_dim=choice(128,192,256) \
-  --search training.lr=loguniform(1e-4,5e-3) \
-  --search model.dropout=uniform(0.0,0.2) \
+  --search-profile graph \
   --num-samples 12 \
   --search-alg optuna \
   --scheduler asha \
   --max-concurrent-trials 1
+```
+
+Rank Tune and batch results, then export the best trial config:
+
+```bash
+PYTHONPATH=src python -m nba_forecasting summarize-results \
+  --root /scratch/izar/$USER/nba_forecasting \
+  --format markdown \
+  --output results.md
+
+PYTHONPATH=src python -m nba_forecasting export-best-config \
+  --summary /scratch/izar/$USER/nba_forecasting/<jobid>/ray_tune/<config>/<timestamp>/ray_tune_summary.json \
+  --output configs/tuned_<config>.toml
 ```
 
 ## Experiment Starting Points
@@ -146,12 +161,17 @@ PYTHONPATH=src python -m nba_forecasting tune \
 - `e2_static_graph_gat`: static graph model with attention message passing
 - `e3_dynamic_graph`: dynamic graph model
 - `e3_dynamic_graph_direct`: direct 12-step graph decoder
+- `e3_dynamic_graph_attention`: direct dynamic graph model with edge-aware attention message passing
+- `e3_dynamic_graph_mp_ssm`: direct dynamic graph model with an SSM-inspired message-passing layer
 - `e3_graph_ssm`: graph plus state-space-model blocks
 - `e3_graph_ssm_no_social`: graph plus state-space-model blocks without social SSM layers
+- `e5_graph_transformer`: graph-masked and edge-biased spatiotemporal Transformer candidate
+- `e5_graph_transformer_no_graph`, `e5_graph_transformer_shuffled_graph`: matched ablations for the graph Transformer
 - `e4_no_dynamic_edges`, `e4_no_semantic_flags`, `e4_no_velocity`: ablations
 
 Use `configs/base.toml` as the common configuration reference.
 Configs are full-run defaults. For quick tests, keep the same config name and pass runtime overrides such as `--epochs`, `training.max_train_batches`, and `training.max_val_batches`.
+Tune search profiles are `basic`, `graph`, `graph_fixed_message`, `graph_ssm`, and `graph_transformer`. Use `graph_fixed_message` when the config should keep its message-passing type fixed, such as an attention-only graph run. Use `--search-profile none` with explicit `--search PATH=EXPR` flags for fully custom searches.
 
 ## Development Checks
 

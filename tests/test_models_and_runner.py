@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -20,6 +21,8 @@ from nba_forecasting.data import (
 )
 from nba_forecasting.metrics import normalized_mse_loss
 from nba_forecasting.models import build_model
+from nba_forecasting.models.graph_layers import MessagePassingSSMLayer, _distance_sorted_social_inputs
+from nba_forecasting.models.graph_transformer import GraphMultiheadAttention
 from nba_forecasting.runner import (
     cross_validate_experiment,
     repeat_trials_experiment,
@@ -156,6 +159,7 @@ class ModelAndRunnerTests(unittest.TestCase):
             ("e3_dynamic_graph", True, True, False, "autoregressive", False, False),
             ("e3_dynamic_graph", True, True, True, "direct", True, True),
             ("e3_graph_ssm", True, True, True, "autoregressive", True, True),
+            ("e5_graph_transformer", True, True, True, "direct", False, False),
         ]:
             config = make_config(
                 model_name=model_name,
@@ -169,6 +173,12 @@ class ModelAndRunnerTests(unittest.TestCase):
             if model_name in {"e3_dynamic_graph", "e3_graph_ssm"} and use_semantic_flags:
                 config.model.message_passing_type = "gat"
                 config.model.separate_ball_head = True
+            if model_name == "e5_graph_transformer":
+                config.model.hidden_dim = 64
+                config.model.transformer_heads = 4
+                config.model.spatial_layers = 1
+                config.model.temporal_layers = 1
+                config.model.decoder_layers = 1
             model = build_model(config)
             context = make_context(batch_size=2, use_velocity=use_velocity)
             future = torch.randn(2, 12, 11, 2)
@@ -180,6 +190,232 @@ class ModelAndRunnerTests(unittest.TestCase):
             )
             self.assertEqual(tuple(output.shape), (2, 12, 11, 2))
             self.assertTrue(torch.isfinite(output).all())
+
+    def test_social_ordering_excludes_self(self) -> None:
+        node_state = torch.tensor([[[10.0], [20.0], [30.0]]])
+        positions = torch.tensor([[[0.0, 0.0], [1.0, 0.0], [3.0, 0.0]]])
+        static = torch.zeros(1, 3, 2)
+        edge_proj = torch.nn.Linear(3, 1, bias=False)
+        torch.nn.init.zeros_(edge_proj.weight)
+
+        social = _distance_sorted_social_inputs(
+            node_state,
+            positions,
+            static,
+            edge_proj,
+            use_semantic_flags=False,
+        ).squeeze(-1)
+
+        self.assertEqual(tuple(social.shape), (1, 3, 2))
+        self.assertEqual(social[0, 0].tolist(), [20.0, 30.0])
+        self.assertEqual(social[0, 1].tolist(), [10.0, 30.0])
+        self.assertEqual(social[0, 2].tolist(), [20.0, 10.0])
+
+    def test_zero_social_ssm_layers_bypass_social_branch(self) -> None:
+        for model_name in ["e1_social_ssm", "e3_graph_ssm"]:
+            with self.subTest(model=model_name):
+                config = make_config(model_name, use_velocity=True, use_relation_types=True, use_entity_embeddings=True)
+                config.model.social_ssm_layers = 0
+                config.model.dropout = 0.0
+                model = build_model(config).eval()
+                context = make_context(batch_size=2, use_velocity=True)
+                with torch.no_grad():
+                    before = model(context)
+                    for parameter in model.social_edge_proj.parameters():
+                        parameter.add_(torch.randn_like(parameter))
+                    for parameter in model.fusion_gate.parameters():
+                        parameter.add_(torch.randn_like(parameter))
+                    for parameter in model.fusion_norm.parameters():
+                        parameter.add_(torch.randn_like(parameter))
+                    after = model(context)
+                self.assertTrue(torch.allclose(before, after, atol=1e-6))
+
+    def test_mp_ssm_layer_is_permutation_equivariant(self) -> None:
+        torch.manual_seed(3)
+        layer = MessagePassingSSMLayer(node_dim=8, edge_dim=3, message_dim=8, dropout=0.0).eval()
+        node_state = torch.randn(2, 4, 8)
+        edge_feat = torch.randn(2, 4, 4, 3)
+        mask = torch.ones(2, 4, 4, dtype=torch.bool)
+        mask[:, torch.arange(4), torch.arange(4)] = False
+        permutation = torch.tensor([2, 0, 3, 1])
+
+        with torch.no_grad():
+            output = layer(node_state, edge_feat, mask)
+            permuted_output = layer(
+                node_state[:, permutation],
+                edge_feat[:, permutation][:, :, permutation],
+                mask[:, permutation][:, :, permutation],
+            )
+
+        self.assertTrue(torch.allclose(permuted_output, output[:, permutation], atol=1e-6))
+
+    def test_graph_attention_masks_and_edge_biases(self) -> None:
+        torch.manual_seed(5)
+        attention = GraphMultiheadAttention(hidden_dim=8, edge_dim=3, num_heads=2, dropout=0.0).eval()
+        node_state = torch.randn(1, 3, 8)
+        edge_feat = torch.randn(1, 3, 3, 3)
+        mask = torch.zeros(1, 3, 3, dtype=torch.bool)
+        mask[:, :, 1] = True
+
+        with torch.no_grad():
+            baseline = attention(node_state, edge_feat, mask)
+            changed = node_state.clone()
+            changed[:, 2] = changed[:, 2] + 100.0
+            changed_edges = edge_feat.clone()
+            changed_edges[:, :, 2] = changed_edges[:, :, 2] + 100.0
+            masked_changed = attention(changed, changed_edges, mask)
+
+        self.assertEqual(tuple(baseline.shape), (1, 3, 8))
+        self.assertTrue(torch.allclose(baseline[:, 0], masked_changed[:, 0], atol=1e-6))
+
+        edge_a = torch.zeros_like(edge_feat)
+        edge_b = torch.zeros_like(edge_feat)
+        edge_b[:, :, 1] = 1.0
+        dense_mask = torch.ones(1, 3, 3, dtype=torch.bool)
+        dense_mask[:, torch.arange(3), torch.arange(3)] = False
+        with torch.no_grad():
+            biased_a = attention(node_state, edge_a, dense_mask)
+            biased_b = attention(node_state, edge_b, dense_mask)
+        self.assertFalse(torch.allclose(biased_a, biased_b))
+
+    def test_graph_attention_matches_torch_multihead_attention_without_edge_bias(self) -> None:
+        torch.manual_seed(11)
+        attention = GraphMultiheadAttention(hidden_dim=8, edge_dim=3, num_heads=2, dropout=0.0, use_edge_bias=False).eval()
+        reference = torch.nn.MultiheadAttention(embed_dim=8, num_heads=2, dropout=0.0, batch_first=True).eval()
+        with torch.no_grad():
+            reference.in_proj_weight.copy_(torch.cat([attention.query.weight, attention.key.weight, attention.value.weight], dim=0))
+            reference.in_proj_bias.copy_(torch.cat([attention.query.bias, attention.key.bias, attention.value.bias], dim=0))
+            reference.out_proj.weight.copy_(attention.output.weight)
+            reference.out_proj.bias.copy_(attention.output.bias)
+
+        node_state = torch.randn(2, 4, 8)
+        edge_feat = torch.randn(2, 4, 4, 3)
+        mask = torch.tensor(
+            [
+                [
+                    [False, True, False, True],
+                    [True, False, True, False],
+                    [False, True, False, True],
+                    [True, False, True, False],
+                ],
+                [
+                    [False, True, True, False],
+                    [True, False, False, True],
+                    [True, False, False, True],
+                    [False, True, True, False],
+                ],
+            ]
+        )
+
+        with torch.no_grad():
+            output = attention(node_state, edge_feat, mask)
+            reference_mask = (~mask).repeat_interleave(attention.num_heads, dim=0)
+            expected, _ = reference(node_state, node_state, node_state, attn_mask=reference_mask, need_weights=False)
+
+        self.assertTrue(torch.allclose(output, expected, atol=1e-6))
+
+    def test_graph_attention_matches_explicit_edge_biased_formula(self) -> None:
+        torch.manual_seed(13)
+        attention = GraphMultiheadAttention(hidden_dim=8, edge_dim=3, num_heads=2, dropout=0.0).eval()
+        node_state = torch.randn(2, 4, 8)
+        edge_feat = torch.randn(2, 4, 4, 3)
+        mask = torch.tensor(
+            [
+                [
+                    [False, True, False, True],
+                    [True, False, True, False],
+                    [False, True, False, True],
+                    [True, False, True, False],
+                ],
+                [
+                    [False, True, True, False],
+                    [True, False, False, True],
+                    [True, False, False, True],
+                    [False, True, True, False],
+                ],
+            ]
+        )
+
+        with torch.no_grad():
+            output = attention(node_state, edge_feat, mask)
+            batch_size, num_entities, _ = node_state.shape
+            query = attention.query(node_state).reshape(batch_size, num_entities, attention.num_heads, attention.head_dim).transpose(1, 2)
+            key = attention.key(node_state).reshape(batch_size, num_entities, attention.num_heads, attention.head_dim).transpose(1, 2)
+            value = attention.value(node_state).reshape(batch_size, num_entities, attention.num_heads, attention.head_dim).transpose(1, 2)
+            logits = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(attention.head_dim)
+            logits = logits + attention.edge_bias(edge_feat).permute(0, 3, 1, 2)
+            logits = logits.masked_fill(~mask.unsqueeze(1), float("-inf"))
+            weights = torch.softmax(logits, dim=-1)
+            expected = torch.matmul(weights, value).transpose(1, 2).reshape(batch_size, num_entities, attention.hidden_dim)
+            expected = attention.output(expected)
+
+        self.assertTrue(torch.allclose(output, expected, atol=1e-6))
+
+    def test_graph_transformer_ablation_masks_are_distinct(self) -> None:
+        positions = torch.tensor(
+            [
+                [
+                    [0.0, 0.0],
+                    [1.0, 0.0],
+                    [3.0, 0.0],
+                    [10.0, 0.0],
+                ]
+            ]
+        )
+        static = torch.ones(1, 4, 2)
+        masks = {}
+        for mode in ["normal", "no_graph", "shuffled_graph"]:
+            config = make_config("e5_graph_transformer", use_velocity=True, use_semantic_flags=False)
+            config.experiment.num_entities = 4
+            config.model.hidden_dim = 16
+            config.model.transformer_heads = 4
+            config.model.graph_ablation_mode = mode
+            config.model.k_neighbors = 1
+            model = build_model(config)
+            _, masks[mode] = model.graph_inputs(positions, static)
+
+        self.assertLess(int(masks["normal"].sum()), int(masks["no_graph"].sum()))
+        self.assertFalse(torch.equal(masks["normal"], masks["shuffled_graph"]))
+        self.assertEqual(tuple(masks["normal"].shape), tuple(masks["shuffled_graph"].shape))
+
+    def test_graph_transformer_is_permutation_equivariant_without_entity_embeddings(self) -> None:
+        config = make_config(
+            "e5_graph_transformer",
+            use_velocity=True,
+            dynamic_edges=False,
+            use_semantic_flags=True,
+            use_entity_embeddings=False,
+        )
+        config.model.hidden_dim = 32
+        config.model.transformer_heads = 4
+        config.model.spatial_layers = 1
+        config.model.temporal_layers = 1
+        config.model.decoder_layers = 1
+        config.model.dropout = 0.0
+        model = build_model(config).eval()
+        context = make_context(batch_size=2, use_velocity=True)
+        permutation = torch.tensor([2, 0, 1, 3, 5, 4, 6, 8, 7, 10, 9])
+
+        with torch.no_grad():
+            output = model(context)
+            permuted_output = model(context[:, :, permutation])
+
+        self.assertTrue(torch.allclose(permuted_output, output[:, :, permutation], atol=1e-5))
+
+    def test_graph_transformer_forward_backward(self) -> None:
+        config = make_config("e5_graph_transformer", use_velocity=True, use_semantic_flags=True, use_entity_embeddings=True)
+        config.model.hidden_dim = 32
+        config.model.transformer_heads = 4
+        config.model.spatial_layers = 1
+        config.model.temporal_layers = 1
+        config.model.decoder_layers = 1
+        model = build_model(config)
+        context = make_context(batch_size=2, use_velocity=True)
+        future = torch.randn(2, 12, 11, 2)
+        prediction = model(context)
+        loss = normalized_mse_loss(prediction, future)
+        loss.backward()
+        self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))
 
     def test_joint_gru_can_overfit_tiny_subset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -4,13 +4,71 @@ import json
 import re
 import shutil
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
 from .config import load_config, parse_override_value, resolve_config_paths
-from .runner import evaluate_checkpoint, train_experiment
 
 SEARCH_PATTERN = re.compile(r"^(?P<kind>[a-z_]+)\((?P<body>.*)\)$")
+SEARCH_PROFILES: dict[str, list[str]] = {
+    "basic": [
+        "model.hidden_dim=choice(128,192,256)",
+        "training.lr=loguniform(1e-4,5e-3)",
+        "model.dropout=uniform(0.0,0.2)",
+    ],
+    "graph": [
+        "model.hidden_dim=choice(128,192,256)",
+        "training.lr=loguniform(1e-4,5e-3)",
+        "model.dropout=uniform(0.0,0.2)",
+        "model.message_dim=choice(128,192,256)",
+        "model.k_neighbors=choice(3,5,7)",
+        "model.message_passing_type=choice(mpnn,gat,mp_ssm)",
+    ],
+    "graph_fixed_message": [
+        "model.hidden_dim=choice(128,192,256)",
+        "training.lr=loguniform(1e-4,5e-3)",
+        "model.dropout=uniform(0.0,0.2)",
+        "model.message_dim=choice(128,192,256)",
+        "model.k_neighbors=choice(3,5,7)",
+    ],
+    "graph_ssm": [
+        "model.hidden_dim=choice(128,192,256)",
+        "training.lr=loguniform(1e-4,5e-3)",
+        "model.dropout=uniform(0.0,0.2)",
+        "model.message_dim=choice(128,192,256)",
+        "model.k_neighbors=choice(3,5,7)",
+        "model.message_passing_type=choice(mpnn,mp_ssm)",
+        "model.temporal_ssm_layers=choice(1,2,3)",
+        "model.social_ssm_layers=choice(0,1,2)",
+        "model.decoder_ssm_layers=choice(1,2,3)",
+        "model.ssm_conv_kernel=choice(3,5)",
+    ],
+    "graph_transformer": [
+        "model.hidden_dim=choice(128,192,256)",
+        "training.lr=loguniform(1e-4,5e-3)",
+        "model.dropout=uniform(0.0,0.2)",
+        "model.k_neighbors=choice(3,5,7)",
+        "model.transformer_heads=choice(4,8)",
+        "model.spatial_layers=choice(1,2,3)",
+        "model.temporal_layers=choice(1,2,3)",
+        "model.decoder_layers=choice(1,2)",
+        "model.transformer_ffn_multiplier=choice(2.0,3.0)",
+    ],
+}
+
+
+def resolve_search_specs(profile: str | None, search_specs: list[str] | None = None) -> list[str]:
+    profile_specs: list[str] = []
+    if profile and profile != "none":
+        if profile not in SEARCH_PROFILES:
+            available = ", ".join(["none", *sorted(SEARCH_PROFILES)])
+            raise ValueError(f"Unknown search profile {profile!r}. Available profiles: {available}.")
+        profile_specs = SEARCH_PROFILES[profile]
+    resolved = [*profile_specs, *(search_specs or [])]
+    if not resolved:
+        raise ValueError("At least one --search specification or --search-profile is required.")
+    return resolved
 
 
 def _timestamp() -> str:
@@ -98,6 +156,10 @@ def run_ray_tune_search(
     ray_address: str | None = None,
 ) -> Path:
     ray, ray_train, tune, Checkpoint, ASHAScheduler, ConcurrencyLimiter, OptunaSearch = _require_ray()
+    from .runner import evaluate_checkpoint, train_experiment
+
+    started_at = datetime.now()
+    started_perf = time.perf_counter()
     config, config_path = load_config(config_arg)
     resolved_config_arg = str(config_path)
     if overrides:
@@ -194,11 +256,20 @@ def run_ray_tune_search(
             )
         summary = {
             "config": str(config_path),
+            "started_at": started_at.isoformat(),
+            "finished_at": datetime.now().isoformat(),
+            "elapsed_s": time.perf_counter() - started_perf,
             "search_specs": search_specs,
             "num_samples": num_samples,
             "search_algorithm": search_algorithm,
             "scheduler": scheduler_name,
             "metric": metric_name,
+            "training_epochs": config.training.epochs,
+            "training_max_train_batches": config.training.max_train_batches,
+            "training_max_val_batches": config.training.max_val_batches,
+            "cpus_per_trial": cpus_per_trial,
+            "gpus_per_trial": gpus_per_trial,
+            "max_concurrent_trials": max_concurrent_trials,
             "best_trial": {
                 "path": best_result.path,
                 "config": best_result.config,
