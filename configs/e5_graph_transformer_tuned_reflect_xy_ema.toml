@@ -1,0 +1,13 @@
+extends = "e5_graph_transformer_tuned_reflect_xy.toml"
+
+# Phase 4 (weight averaging): exponential moving average of the weights on the Phase-1
+# x+y reflection best. EMA needs no LR schedule, so it is the primary Phase-4 lever.
+# decay=0.999 is the headline window; the ablation also sweeps {0.99, 0.9999} via
+# `--set training.ema_decay=...`. The EMA model is what gets validated and saved to
+# best.pt (see runner._validation_model), and it reloads as a plain model that composes
+# with Phase-3 TTA at inference. Default config keeps ema_decay=0.0 (off).
+[experiment]
+name = "e5_graph_transformer_tuned_reflect_xy_ema"
+
+[training]
+ema_decay = 0.999

@@ -58,6 +58,8 @@ class ExperimentSection:
 @dataclass(slots=True)
 class FeatureSection:
     use_velocity: bool = True
+    reflect_prob: float = 0.0  # probability of a y -> -y court mirror (left/right)
+    reflect_x_prob: float = 0.0  # probability of an x -> -x court mirror (attack-direction)
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> FeatureSection:
@@ -93,6 +95,10 @@ class ModelSection:
     graph_ablation_mode: str = "normal"
     optimization_backend: str = "none"
     graph_prep_backend: str = "torch"
+    # Phase 7 (D1) mixture-density head. Defaults reproduce the deterministic delta head.
+    head_type: str = "delta"  # delta | mdn
+    mdn_components: int = 1  # K trajectory modes when head_type == "mdn"
+    mdn_point_estimate: str = "mean"  # mean (pi-weighted) | mode (argmax pi) for the point output
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> ModelSection:
@@ -105,7 +111,7 @@ class TrainingSection:
     batch_size: int = 128
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    lr_scheduler: str = "none"
+    lr_scheduler: str = "none"  # none | multistep | cosine | cosine_warmup
     lr_milestones: list[int] = field(default_factory=list)
     lr_gamma: float = 0.1
     grad_clip: float = 1.0
@@ -116,6 +122,9 @@ class TrainingSection:
     scheduled_sampling_final_prob: float = 0.0
     ema_decay: float = 0.0
     swa_start_pct: float = 0.0
+    lr_warmup_epochs: int = 0  # linear-warmup length used by cosine_warmup
+    lr_min: float = 0.0  # cosine floor (eta_min)
+    swa_lr: float | None = None  # SWALR target for the SWA tail; None -> keep constant LR
     max_train_batches: int | None = None
     max_val_batches: int | None = None
     train_window_sampling: str = "all_windows"
@@ -124,6 +133,22 @@ class TrainingSection:
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> TrainingSection:
+        return cls(**data)
+
+
+@dataclass(slots=True)
+class LossSection:
+    # Physics-prior auxiliary losses. All lambdas default 0.0 -> exact MSE-only behavior.
+    lambda_smooth: float = 0.0  # weight on the second-difference (acceleration) penalty
+    lambda_boundary: float = 0.0  # weight on the off-court hinge
+    lambda_ball: float = 0.0  # weight on the ball-isolation hinge
+    court_x_half: float = 47.0  # half court length (ft); frame is origin-centered
+    court_y_half: float = 25.0  # half court width (ft)
+    boundary_margin: float = 2.0  # ft of slack before the boundary hinge engages
+    ball_max_dist: float = 8.0  # ft; hinge engages when nearest player is farther (~p99)
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> LossSection:
         return cls(**data)
 
 
@@ -142,6 +167,7 @@ class RunConfig:
     features: FeatureSection = field(default_factory=FeatureSection)
     model: ModelSection = field(default_factory=ModelSection)
     training: TrainingSection = field(default_factory=TrainingSection)
+    loss: LossSection = field(default_factory=LossSection)
     evaluation: EvaluationSection = field(default_factory=EvaluationSection)
 
     @property
@@ -155,6 +181,7 @@ class RunConfig:
             features=FeatureSection.from_mapping(data.get("features", {})),
             model=ModelSection.from_mapping(data.get("model", {})),
             training=TrainingSection.from_mapping(data.get("training", {})),
+            loss=LossSection.from_mapping(data.get("loss", {})),
             evaluation=EvaluationSection.from_mapping(data.get("evaluation", {})),
         )
 

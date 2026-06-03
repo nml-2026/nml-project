@@ -41,13 +41,16 @@ transformer_ffn_multiplier = 2.0
 graph_ablation_mode = "normal"
 optimization_backend = "none"
 graph_prep_backend = "torch"
+head_type = "delta"          # delta | mdn (Phase 7: Gaussian-mixture trajectory head)
+mdn_components = 1           # K trajectory modes when head_type = "mdn"
+mdn_point_estimate = "mean"  # mean (pi-weighted) | mode (argmax pi) for the deterministic output
 
 [training]
 epochs = 20
 batch_size = 128
 lr = 0.001
 weight_decay = 0.0001
-lr_scheduler = "none"
+lr_scheduler = "none"      # none | multistep | cosine | cosine_warmup
 lr_milestones = []
 lr_gamma = 0.1
 grad_clip = 1.0
@@ -58,6 +61,9 @@ teacher_forcing_prob = 0.0
 scheduled_sampling_final_prob = 0.0
 ema_decay = 0.0
 swa_start_pct = 0.0
+lr_warmup_epochs = 0      # linear-warmup length used by cosine_warmup
+lr_min = 0.0              # cosine floor (eta_min)
+# swa_lr is unset by default (constant-LR SWA); set it in a config to enable SWALR.
 max_train_batches = 0
 max_val_batches = 0
 train_window_sampling = "all_windows"

@@ -59,6 +59,15 @@ SEARCH_PROFILES: dict[str, list[str]] = {
         "model.decoder_layers=choice(1,2)",
         "model.transformer_ffn_multiplier=choice(2.0,3.0)",
     ],
+    "aux_losses": [
+        "loss.lambda_smooth=loguniform(1e-4,2e-1)",
+        "loss.lambda_boundary=loguniform(1e-4,2e-1)",
+        "loss.lambda_ball=loguniform(1e-4,2e-1)",
+    ],
+    "lr_scheduler": [
+        "training.lr=loguniform(1e-4,1e-3)",
+        "training.swa_lr=loguniform(5e-5,3.5e-4)",
+    ],
 }
 
 

@@ -1,0 +1,20 @@
+extends = "e5_graph_transformer_tuned_reflect_xy.toml"
+
+# Phase 5 (SWA revisit with SWALR): the canonical SWA recipe Phase 4 could not test. Phase 4
+# ran SWA at the *constant* LR (holdout ade 6.2471, much weaker than EMA 0.999's 6.0117) exactly
+# because SWA wants an elevated/cyclic LR tail to sample diverse minima. Here the main LR cosine-
+# anneals until swa_start_pct (epoch ~60 of 80), then torch SWALR holds swa_lr through the tail
+# while AveragedModel tail-averages the snapshots. swa_lr=1.5e-4 (~0.4x the tuned lr 3.49e-4) is
+# a starting point refined by the `lr_scheduler` Ray Tune profile. Patience is set effectively off
+# (>= epochs) so the full SWA tail runs rather than early-stopping before it begins. The averaged
+# weights are saved to best.pt as a plain state dict (see runner._validation_model) and compose
+# with Phase-3 TTA at inference. Phase-4's ..._swa.toml (constant-LR SWA) is kept untouched.
+[experiment]
+name = "e5_graph_transformer_tuned_reflect_xy_swalr"
+
+[training]
+lr_scheduler = "cosine"
+swa_start_pct = 0.75
+swa_lr = 1.5e-4
+epochs = 80
+patience = 80

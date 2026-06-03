@@ -1,0 +1,12 @@
+extends = "e5_graph_transformer_tuned_reflect_xy_aux.toml"
+
+# Phase 2 final: smoothness-only physics prior (boundary/ball left off).
+# lambda_smooth chosen from the Stage A sweep's flat safe region (<=~0.002 is neutral
+# on val ADE; larger clearly hurts). 0.001 exercises the prior at no measured cost.
+[experiment]
+name = "e5_graph_transformer_tuned_reflect_xy_aux_smooth"
+
+[loss]
+lambda_smooth = 0.001
+lambda_boundary = 0.0
+lambda_ball = 0.0

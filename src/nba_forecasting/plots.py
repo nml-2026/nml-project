@@ -29,18 +29,36 @@ def save_history_plot(history: list[dict[str, float]], output_path: str | Path) 
     output.parent.mkdir(parents=True, exist_ok=True)
     epochs = [row["epoch"] for row in history]
     train_loss = [row["train_loss"] for row in history]
-    val_ade = [row["val_ade"] for row in history]
-    val_mse = [row["val_mse"] for row in history]
+    val_ade_l2 = [row.get("val_ade_l2") for row in history]
+    val_fde_l2 = [row.get("val_fde_l2") for row in history]
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     axes[0].plot(epochs, train_loss, label="train_loss")
     axes[0].set_title("Normalized Loss")
     axes[0].set_xlabel("Epoch")
     axes[0].legend()
-    axes[1].plot(epochs, val_ade, label="val_ade")
-    axes[1].plot(epochs, val_mse, label="val_mse")
-    axes[1].set_title("Raw Validation Metrics")
+    axes[1].plot(epochs, val_ade_l2, label="val_ade_l2")
+    axes[1].plot(epochs, val_fde_l2, label="val_fde_l2")
+    axes[1].set_title("Validation Error (court feet)")
     axes[1].set_xlabel("Epoch")
     axes[1].legend()
+    fig.tight_layout()
+    fig.savefig(output, dpi=150)
+    plt.close(fig)
+
+
+def save_per_step_error_plot(per_step_errors: list[float], output_path: str | Path) -> None:
+    if not per_step_errors:
+        return
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    steps = list(range(1, len(per_step_errors) + 1))
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(steps, per_step_errors, marker="o", label="ADE L2")
+    ax.set_title("Per-Step Error (court feet)")
+    ax.set_xlabel("Horizon step")
+    ax.set_ylabel("Mean L2 displacement")
+    ax.grid(alpha=0.2)
+    ax.legend()
     fig.tight_layout()
     fig.savefig(output, dpi=150)
     plt.close(fig)

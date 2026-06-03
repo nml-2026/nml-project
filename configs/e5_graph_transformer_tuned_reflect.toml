@@ -1,0 +1,11 @@
+extends = "e5_graph_transformer_tuned.toml"
+
+# Phase 1 (C2) court-reflection augmentation on the tuned best model.
+# Identical to e5_graph_transformer_tuned except reflect_prob -> the augmented run.
+
+[experiment]
+name = "e5_graph_transformer_tuned_reflect"
+model_name = "e5_graph_transformer"
+
+[features]
+reflect_prob = 0.5

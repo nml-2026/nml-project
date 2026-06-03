@@ -61,6 +61,18 @@ def submit_checkpoint(*args, **kwargs):
     return impl(*args, **kwargs)
 
 
+def evaluate_ensemble(*args, **kwargs):
+    from .runner import evaluate_ensemble as impl
+
+    return impl(*args, **kwargs)
+
+
+def submit_ensemble(*args, **kwargs):
+    from .runner import submit_ensemble as impl
+
+    return impl(*args, **kwargs)
+
+
 def benchmark_experiment(*args, **kwargs):
     from .runner import benchmark_experiment as impl
 
@@ -247,11 +259,70 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--split", required=True, choices=["train", "val", "holdout"])
     eval_parser.add_argument("--output-dir", default=None, help="Optional evaluation output directory.")
     eval_parser.add_argument("--device", default="auto", help="Device for evaluation: auto, cpu, mps, cuda.")
+    eval_parser.add_argument(
+        "--tta",
+        choices=["none", "y", "x", "xy"],
+        default="none",
+        help="Test-time dihedral reflection averaging group (default none = single forward).",
+    )
+    eval_parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Override the dataset directory baked into the checkpoint (e.g. when the checkpoint was trained on another machine).",
+    )
 
     submit_parser = subparsers.add_parser("submit", help="Generate a Kaggle submission from a checkpoint.")
     submit_parser.add_argument("--checkpoint", required=True, help="Path to best.pt")
     submit_parser.add_argument("--output", default=None, help="Optional CSV output path.")
     submit_parser.add_argument("--device", default="auto", help="Device for submission: auto, cpu, mps, cuda.")
+    submit_parser.add_argument(
+        "--tta",
+        choices=["none", "y", "x", "xy"],
+        default="none",
+        help="Test-time dihedral reflection averaging group (default none = single forward).",
+    )
+    submit_parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Override the dataset directory baked into the checkpoint (e.g. when the checkpoint was trained on another machine).",
+    )
+
+    ens_eval_parser = subparsers.add_parser(
+        "ensemble-evaluate", help="Evaluate an averaged N-checkpoint ensemble (each TTA-averaged) on a split."
+    )
+    ens_eval_parser.add_argument("--checkpoints", nargs="+", required=True, help="Two or more best.pt paths to average.")
+    ens_eval_parser.add_argument("--split", required=True, choices=["train", "val", "holdout"])
+    ens_eval_parser.add_argument("--output-dir", default=None, help="Optional evaluation output directory.")
+    ens_eval_parser.add_argument("--device", default="auto", help="Device for evaluation: auto, cpu, mps, cuda.")
+    ens_eval_parser.add_argument(
+        "--tta",
+        choices=["none", "y", "x", "xy"],
+        default="xy",
+        help="Per-model test-time dihedral reflection group (default xy = the LB-winning recipe).",
+    )
+    ens_eval_parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Override the dataset directory baked into the checkpoints (all legs share the frozen split).",
+    )
+
+    ens_submit_parser = subparsers.add_parser(
+        "ensemble-submit", help="Generate a Kaggle submission from an averaged N-checkpoint ensemble."
+    )
+    ens_submit_parser.add_argument("--checkpoints", nargs="+", required=True, help="Two or more best.pt paths to average.")
+    ens_submit_parser.add_argument("--output", default=None, help="Optional CSV output path.")
+    ens_submit_parser.add_argument("--device", default="auto", help="Device for submission: auto, cpu, mps, cuda.")
+    ens_submit_parser.add_argument(
+        "--tta",
+        choices=["none", "y", "x", "xy"],
+        default="xy",
+        help="Per-model test-time dihedral reflection group (default xy = the LB-winning recipe).",
+    )
+    ens_submit_parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Override the dataset directory baked into the checkpoints (all legs share the frozen split).",
+    )
 
     benchmark_parser = subparsers.add_parser("benchmark", help="Benchmark training-step performance for one config.")
     benchmark_parser.add_argument("--config", required=True, help="Config name under configs/ or a direct TOML path.")
@@ -438,12 +509,36 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Ray Tune search complete. Outputs written to {tune_dir}")
         return 0
     if args.command == "evaluate":
-        eval_dir = evaluate_checkpoint(args.checkpoint, args.split, args.output_dir, device_arg=args.device)
+        eval_dir = evaluate_checkpoint(
+            args.checkpoint,
+            args.split,
+            args.output_dir,
+            device_arg=args.device,
+            tta_group=args.tta,
+            data_dir=args.data_dir,
+        )
         print(f"Evaluation complete. Outputs written to {eval_dir}")
         return 0
     if args.command == "submit":
-        submission_path = submit_checkpoint(args.checkpoint, args.output, device_arg=args.device)
+        submission_path = submit_checkpoint(
+            args.checkpoint, args.output, device_arg=args.device, tta_group=args.tta, data_dir=args.data_dir
+        )
         print(f"Submission written to {submission_path}")
+        return 0
+    if args.command == "ensemble-evaluate":
+        eval_dir = evaluate_ensemble(
+            args.checkpoints,
+            args.split,
+            args.output_dir,
+            device_arg=args.device,
+            tta_group=args.tta,
+            data_dir=args.data_dir,
+        )
+        print(f"Ensemble evaluation complete. Outputs written to {eval_dir}")
+        return 0
+    if args.command == "ensemble-submit":
+        submission_path = submit_ensemble(args.checkpoints, args.output, device_arg=args.device, tta_group=args.tta, data_dir=args.data_dir)
+        print(f"Ensemble submission written to {submission_path}")
         return 0
     if args.command == "benchmark":
         overrides = _build_overrides(args)

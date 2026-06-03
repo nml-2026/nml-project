@@ -70,11 +70,99 @@ num_examples = 1
     return config_path
 
 
+def write_mdn_cli_config(root: Path, data_dir: Path, name: str = "cli_mdn") -> Path:
+    config_path = root / f"{name}.toml"
+    config_path.write_text(
+        f"""
+[experiment]
+name = "{name}"
+model_name = "e5_graph_transformer"
+seed = 0
+data_dir = "{data_dir}"
+output_root = "{root / "runs"}"
+split_path = "{root / "artifacts" / "splits" / "default.json"}"
+device = "cpu"
+context_size = 8
+horizon_size = 12
+num_entities = 11
+checkpoint_metric = "ade"
+
+[features]
+use_velocity = true
+
+[model]
+hidden_dim = 32
+dropout = 0.0
+k_neighbors = 2
+transformer_heads = 4
+spatial_layers = 1
+temporal_layers = 1
+decoder_layers = 1
+head_type = "mdn"
+mdn_components = 3
+mdn_point_estimate = "mean"
+
+[training]
+epochs = 1
+batch_size = 4
+lr = 0.01
+weight_decay = 0.0
+grad_clip = 1.0
+num_workers = 0
+patience = 1
+log_every = 10
+
+[evaluation]
+num_examples = 1
+"""
+    )
+    return config_path
+
+
 class CliTests(unittest.TestCase):
+    def test_mdn_cli_train_evaluate_and_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            data_dir = write_synthetic_dataset(root, train_lengths=[20, 22, 24, 26, 28, 30, 32, 34, 36, 38], test_count=2)
+            config_path = write_mdn_cli_config(root, data_dir)
+
+            train_output = io.StringIO()
+            with contextlib.redirect_stdout(train_output):
+                code = main(["train", "--config", str(config_path), "--device", "cpu", "--epochs", "1"])
+            self.assertEqual(code, 0)
+            prefix = "Training complete. Outputs written to "
+            run_dir = Path(next(line.removeprefix(prefix) for line in train_output.getvalue().splitlines() if line.startswith(prefix)))
+            checkpoint = run_dir / "best.pt"
+            self.assertTrue(checkpoint.exists())
+
+            # Evaluate (point estimate) also reports the multimodal minADE_K / minFDE_K.
+            eval_dir = root / "eval_mdn"
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = main(
+                    ["evaluate", "--checkpoint", str(checkpoint), "--split", "val", "--output-dir", str(eval_dir), "--device", "cpu"]
+                )
+            self.assertEqual(code, 0)
+            metrics = json.loads((eval_dir / "metrics.json").read_text())
+            for key in ("ade", "ade_l2", "fde_l2", "min_ade_k", "min_fde_k", "mdn_components"):
+                self.assertIn(key, metrics)
+            self.assertEqual(metrics["mdn_components"], 3.0)
+            # minADE_K is a non-negative court-feet distance (no clean inequality vs the
+            # pi-weighted mean's ADE, since the mean is not one of the K modes).
+            self.assertGreaterEqual(metrics["min_ade_k"], 0.0)
+            self.assertGreaterEqual(metrics["min_fde_k"], 0.0)
+            self.assertEqual(len(json.loads((eval_dir / "per_step_error.json").read_text())["ade_l2_per_step"]), 12)
+
+            # The deterministic submission path is unchanged (point estimate + TTA xy).
+            submission = root / "mdn_submission.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = main(["submit", "--checkpoint", str(checkpoint), "--output", str(submission), "--device", "cpu", "--tta", "xy"])
+            self.assertEqual(code, 0)
+            self.assertTrue(submission.exists())
+
     def test_module_cli_train_evaluate_and_submit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            data_dir = write_synthetic_dataset(root, train_lengths=[20, 22, 24, 26, 28, 30], test_count=2)
+            data_dir = write_synthetic_dataset(root, train_lengths=[20, 22, 24, 26, 28, 30, 32, 34, 36, 38], test_count=2)
             config_path = write_cli_config(root, data_dir)
 
             train_output = io.StringIO()
@@ -116,6 +204,12 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(code, 0)
             self.assertTrue((eval_dir / "metrics.json").exists())
+            eval_metrics = json.loads((eval_dir / "metrics.json").read_text())
+            self.assertIn("ade_l2", eval_metrics)
+            self.assertIn("fde_l2", eval_metrics)
+            self.assertTrue((eval_dir / "per_step_error.json").exists())
+            per_step = json.loads((eval_dir / "per_step_error.json").read_text())
+            self.assertEqual(len(per_step["ade_l2_per_step"]), 12)
 
             submission = root / "submission.csv"
             code = main(
@@ -131,6 +225,86 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(code, 0)
             self.assertTrue(submission.exists())
+
+            # Test-time augmentation (Phase 3): evaluate + submit with the full dihedral group.
+            tta_eval_dir = root / "eval_cli_tta"
+            code = main(
+                [
+                    "evaluate",
+                    "--checkpoint",
+                    str(checkpoint),
+                    "--split",
+                    "val",
+                    "--output-dir",
+                    str(tta_eval_dir),
+                    "--device",
+                    "cpu",
+                    "--tta",
+                    "xy",
+                ]
+            )
+            self.assertEqual(code, 0)
+            tta_metrics = json.loads((tta_eval_dir / "metrics.json").read_text())
+            self.assertEqual(tta_metrics["tta_group"], "xy")
+            tta_per_step = json.loads((tta_eval_dir / "per_step_error.json").read_text())
+            self.assertEqual(len(tta_per_step["ade_l2_per_step"]), 12)
+
+            tta_submission = root / "submission_tta.csv"
+            code = main(
+                [
+                    "submit",
+                    "--checkpoint",
+                    str(checkpoint),
+                    "--output",
+                    str(tta_submission),
+                    "--device",
+                    "cpu",
+                    "--tta",
+                    "xy",
+                ],
+            )
+            self.assertEqual(code, 0)
+            self.assertTrue(tta_submission.exists())
+
+            # Phase 6: single-checkpoint ensemble commands (N=1) via the CLI.
+            ens_eval_dir = root / "eval_cli_ensemble"
+            code = main(
+                [
+                    "ensemble-evaluate",
+                    "--checkpoints",
+                    str(checkpoint),
+                    "--split",
+                    "val",
+                    "--output-dir",
+                    str(ens_eval_dir),
+                    "--device",
+                    "cpu",
+                    "--tta",
+                    "xy",
+                ]
+            )
+            self.assertEqual(code, 0)
+            ens_metrics = json.loads((ens_eval_dir / "metrics.json").read_text())
+            self.assertEqual(ens_metrics["tta_group"], "xy")
+            self.assertEqual(ens_metrics["ensemble_n"], 1)
+            self.assertEqual(len(json.loads((ens_eval_dir / "per_step_error.json").read_text())["ade_l2_per_step"]), 12)
+
+            ens_submission = root / "ensemble_submission.csv"
+            code = main(
+                [
+                    "ensemble-submit",
+                    "--checkpoints",
+                    str(checkpoint),
+                    "--output",
+                    str(ens_submission),
+                    "--device",
+                    "cpu",
+                    "--tta",
+                    "xy",
+                ]
+            )
+            self.assertEqual(code, 0)
+            self.assertTrue(ens_submission.exists())
 
     def test_train_many_cli_dispatches_cluster_arguments(self) -> None:
         with patch("nba_forecasting.cli.train_many_experiments") as train_many:

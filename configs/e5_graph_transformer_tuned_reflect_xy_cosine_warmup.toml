@@ -1,0 +1,13 @@
+extends = "e5_graph_transformer_tuned_reflect_xy.toml"
+
+# Phase 5 (LR schedule): linear warmup (5 epochs) then cosine anneal, on the Phase-1 x+y
+# reflection best. Warmup stabilizes early training before the cosine decay. Same 80-epoch /
+# patience-20 budget as the plain-cosine variant for an apples-to-apples comparison.
+[experiment]
+name = "e5_graph_transformer_tuned_reflect_xy_cosine_warmup"
+
+[training]
+lr_scheduler = "cosine_warmup"
+lr_warmup_epochs = 5
+epochs = 80
+patience = 20

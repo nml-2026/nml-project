@@ -1,0 +1,15 @@
+extends = "e5_graph_transformer_tuned_reflect_xy.toml"
+
+# Phase 4 (weight averaging): stochastic weight averaging on the Phase-1 x+y reflection
+# best. swa_start_pct=0.75 averages the model snapshots over the last 25% of the 50-epoch
+# run (epochs ~38-50). The models use only LayerNorm (no BatchNorm), so SWA's update_bn is
+# a no-op and is intentionally not called.
+#
+# NOTE: this runs at the current *constant* LR (the project has no LR scheduler yet).
+# Canonical SWA wants an elevated/cyclic LR tail (torch SWALR); that is deferred to Phase 5
+# (LR schedule), where SWA should be revisited. Here SWA is plain tail-averaging.
+[experiment]
+name = "e5_graph_transformer_tuned_reflect_xy_swa"
+
+[training]
+swa_start_pct = 0.75

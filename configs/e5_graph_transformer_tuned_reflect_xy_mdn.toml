@@ -1,0 +1,23 @@
+extends = "e5_graph_transformer_tuned_reflect_xy.toml"
+
+# Phase 7 (D1) Mixture Density Network head on the canonical Phase-1 x+y reflect model.
+# The decoder emits K coherent Gaussian trajectory modes per entity (per-entity mixture
+# weights shared across the horizon); training optimizes the mixture NLL instead of MSE,
+# while checkpoint selection stays on val `ade` (squared error of the point estimate) so
+# model selection still tracks Kaggle. forward() returns the pi-weighted mean trajectory
+# (Bayes-optimal point estimate for the squared metric), so TTA/ensemble/submit compose
+# unchanged. Evaluation also reports marginal minADE_K / minFDE_K (the multimodal metrics).
+#
+# Honest framing (see implementation_plan.md Phase 7): an NLL-trained MDN is NOT expected
+# to beat the Phase-6 ensemble (LB 2.95365) on the deterministic squared metric -- this is
+# report/originality value and the minADE_K prerequisite. K is the main knob; sweep it via
+# --set model.mdn_components=... in the Phase-7 cluster job.
+
+[experiment]
+name = "e5_graph_transformer_tuned_reflect_xy_mdn"
+model_name = "e5_graph_transformer"
+
+[model]
+head_type = "mdn"
+mdn_components = 3
+mdn_point_estimate = "mean"

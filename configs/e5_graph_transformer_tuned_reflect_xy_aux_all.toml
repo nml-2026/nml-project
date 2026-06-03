@@ -1,0 +1,12 @@
+extends = "e5_graph_transformer_tuned_reflect_xy_aux.toml"
+
+# Phase 2 ablation: all three physics priors on. boundary/ball weights are the Stage B/C
+# joint-sweep winners (fixing lambda_smooth=0.001). Included for a complete ablation row;
+# the sweeps indicate boundary/ball are near-inert-to-slightly-negative on val ADE.
+[experiment]
+name = "e5_graph_transformer_tuned_reflect_xy_aux_all"
+
+[loss]
+lambda_smooth = 0.001
+lambda_boundary = 0.0168
+lambda_ball = 0.00037

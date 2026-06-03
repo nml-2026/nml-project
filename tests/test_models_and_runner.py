@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 
 from nba_forecasting.config import RunConfig, apply_overrides, load_config, parse_override_value
 from nba_forecasting.data import (
+    Normalizer,
     NotebookRandomWindowSampler,
     NotebookSequenceDataset,
     SequenceWindowDataset,
@@ -21,13 +22,23 @@ from nba_forecasting.data import (
 )
 from nba_forecasting.metrics import normalized_mse_loss
 from nba_forecasting.models import build_model
+from nba_forecasting.models.common import reduce_mixture
 from nba_forecasting.models.graph_layers import MessagePassingSSMLayer, _distance_sorted_social_inputs
 from nba_forecasting.models.graph_transformer import GraphMultiheadAttention
 from nba_forecasting.runner import (
+    TTA_GROUPS,
+    ExponentialMovingAverage,
     _build_lr_scheduler,
+    _denormalize_predictions,
+    _ensemble_predict_raw,
+    _load_checkpoint,
+    _tta_predict,
     cross_validate_experiment,
+    evaluate_checkpoint,
+    evaluate_ensemble,
     repeat_trials_experiment,
     submit_checkpoint,
+    submit_ensemble,
     train_experiment,
     train_many_experiments,
 )
@@ -865,6 +876,214 @@ num_examples = 1
             self.assertIn(checkpoint["eval_model_kind"], {"ema", "swa"})
             self.assertEqual(checkpoint["config"]["model"]["decoder_type"], "direct")
 
+    def test_ema_update_applies_decay_formula(self) -> None:
+        class _Tiny(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.w = torch.nn.Parameter(torch.tensor([2.0, 4.0]))
+                self.register_buffer("count", torch.tensor(3, dtype=torch.long))
+
+        model = _Tiny()
+        ema = ExponentialMovingAverage(model, decay=0.9)
+        with torch.no_grad():
+            model.w.copy_(torch.tensor([12.0, 24.0]))
+            model.count.copy_(torch.tensor(7, dtype=torch.long))
+        ema.update(model)
+        # Float params follow decay*ema + (1-decay)*source; non-float buffers are copied.
+        self.assertTrue(torch.allclose(ema.model.w, torch.tensor([3.0, 6.0]), atol=1e-6))
+        self.assertEqual(int(ema.model.count.item()), 7)
+
+    def _train_weight_avg_run(
+        self,
+        root: Path,
+        *,
+        ema_decay: float,
+        swa_start_pct: float,
+        epochs: int,
+        lr_scheduler: str = "none",
+        swa_lr: float | None = None,
+    ) -> Path:
+        data_dir = write_synthetic_dataset(root, train_lengths=[20, 22, 24, 26, 28, 30], test_count=2)
+        config_path = root / "wavg.toml"
+        swa_lr_line = f"swa_lr = {swa_lr}\n" if swa_lr is not None else ""
+        config_path.write_text(
+            f"""
+[experiment]
+name = "wavg"
+model_name = "e3_dynamic_graph"
+seed = 0
+data_dir = "{data_dir}"
+output_root = "{root / "runs"}"
+split_path = "{root / "artifacts" / "splits" / "default.json"}"
+device = "cpu"
+context_size = 8
+horizon_size = 12
+num_entities = 11
+checkpoint_metric = "ade"
+
+[features]
+use_velocity = true
+
+[model]
+hidden_dim = 32
+message_dim = 32
+num_layers = 1
+dropout = 0.0
+k_neighbors = 2
+use_semantic_flags = true
+dynamic_edges = true
+decoder_type = "direct"
+direct_decoder_heads = 2
+message_passing_type = "mpnn"
+
+[training]
+epochs = {epochs}
+batch_size = 4
+lr = 0.01
+weight_decay = 0.0
+grad_clip = 1.0
+num_workers = 0
+patience = {epochs}
+log_every = 10
+ema_decay = {ema_decay}
+swa_start_pct = {swa_start_pct}
+lr_scheduler = "{lr_scheduler}"
+{swa_lr_line}
+[evaluation]
+num_examples = 1
+"""
+        )
+        return train_experiment(str(config_path))
+
+    def test_ema_only_checkpoint_round_trips_as_plain_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            run_dir = self._train_weight_avg_run(root, ema_decay=0.9, swa_start_pct=0.0, epochs=2)
+            checkpoint = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
+            self.assertEqual(checkpoint["eval_model_kind"], "ema")
+            # The averaged weights persist as a plain, loadable model (no AveragedModel wrapper).
+            _, _, _, model = _load_checkpoint(run_dir / "best.pt", torch.device("cpu"))
+            with torch.no_grad():
+                prediction = model(make_context(batch_size=2, use_velocity=True))
+            self.assertEqual(tuple(prediction.shape), (2, 12, 11, 2))
+
+    def test_swa_only_checkpoint_round_trips_as_plain_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            # epochs=2, swa_start_pct=0.5 -> swa_start_epoch=1, so SWA is the eval/checkpoint
+            # model from the first epoch and best.pt is guaranteed to be the SWA average.
+            run_dir = self._train_weight_avg_run(root, ema_decay=0.0, swa_start_pct=0.5, epochs=2)
+            checkpoint = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
+            self.assertEqual(checkpoint["eval_model_kind"], "swa")
+            _, _, _, model = _load_checkpoint(run_dir / "best.pt", torch.device("cpu"))
+            with torch.no_grad():
+                prediction = model(make_context(batch_size=2, use_velocity=True))
+            self.assertEqual(tuple(prediction.shape), (2, 12, 11, 2))
+
+    def test_canonical_model_has_no_batchnorm(self) -> None:
+        # SWA's update_bn is intentionally not called because the models carry no BatchNorm
+        # running buffers (only LayerNorm). Guard against a future arch change breaking that.
+        model = build_model(make_config("e5_graph_transformer", use_velocity=True))
+        batchnorm_layers = [module for module in model.modules() if isinstance(module, torch.nn.modules.batchnorm._BatchNorm)]
+        self.assertEqual(batchnorm_layers, [])
+
+    def test_lr_schedule_defaults_to_off(self) -> None:
+        # Default reproduces the fixed-LR behavior: no schedule, no SWALR.
+        config = make_config("e1_joint_gru")
+        self.assertEqual(config.training.lr_scheduler, "none")
+        self.assertIsNone(config.training.swa_lr)
+
+    def test_lr_schedule_parses_from_toml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "sched.toml"
+            config_path.write_text(
+                """
+[experiment]
+name = "sched"
+model_name = "e1_joint_gru"
+
+[training]
+lr_scheduler = "cosine"
+lr_warmup_epochs = 3
+lr_min = 1e-5
+swa_lr = 1.5e-4
+"""
+            )
+            config, _ = load_config(config_path)
+            self.assertEqual(config.training.lr_scheduler, "cosine")
+            self.assertEqual(config.training.lr_warmup_epochs, 3)
+            self.assertAlmostEqual(config.training.lr_min, 1e-5)
+            self.assertAlmostEqual(config.training.swa_lr, 1.5e-4)
+
+    def test_build_lr_scheduler_none_is_noop_and_cosine_decays(self) -> None:
+        config = make_config("e1_joint_gru")
+        config.training.lr = 0.01
+        config.training.epochs = 10
+        model = build_model(config)
+
+        # "none" -> no scheduler object, constant LR.
+        config.training.lr_scheduler = "none"
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.lr)
+        self.assertIsNone(_build_lr_scheduler(config, optimizer))
+
+        # "cosine" -> LR strictly decreases as the scheduler steps.
+        config.training.lr_scheduler = "cosine"
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.lr)
+        scheduler = _build_lr_scheduler(config, optimizer)
+        self.assertIsNotNone(scheduler)
+        optimizer.step()  # no-op (no grads) -> mirrors real per-batch order, silences warning
+        lrs = [optimizer.param_groups[0]["lr"]]
+        for _ in range(5):
+            scheduler.step()
+            lrs.append(optimizer.param_groups[0]["lr"])
+        self.assertTrue(all(b < a for a, b in zip(lrs, lrs[1:], strict=False)), lrs)
+
+        # "cosine_warmup" -> builds a (Sequential) scheduler; LR rises during warmup.
+        config.training.lr_scheduler = "cosine_warmup"
+        config.training.lr_warmup_epochs = 3
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.lr)
+        warmup_scheduler = _build_lr_scheduler(config, optimizer)
+        self.assertIsNotNone(warmup_scheduler)
+        optimizer.step()
+        start_lr = optimizer.param_groups[0]["lr"]
+        warmup_scheduler.step()
+        self.assertGreater(optimizer.param_groups[0]["lr"], start_lr)
+
+        # Unknown kind is rejected.
+        config.training.lr_scheduler = "bogus"
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.lr)
+        with self.assertRaises(ValueError):
+            _build_lr_scheduler(config, optimizer)
+
+    def test_cosine_schedule_records_decaying_lr_in_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            run_dir = self._train_weight_avg_run(root, ema_decay=0.0, swa_start_pct=0.0, epochs=3, lr_scheduler="cosine")
+            history = pd.read_csv(run_dir / "history.csv")
+            lrs = history["lr"].tolist()
+            self.assertEqual(len(lrs), 3)
+            self.assertTrue(all(b < a for a, b in zip(lrs, lrs[1:], strict=False)), lrs)
+
+    def test_swalr_engages_in_swa_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            # epochs=4, swa_start_pct=0.25 -> swa_start_epoch=1, so SWA is the eval/checkpoint
+            # model from the first epoch (best.pt is guaranteed the SWA average). An *elevated*
+            # swa_lr (0.05 > base lr 0.01) makes SWALR's effect unambiguous: the LR climbs above
+            # the base LR through the tail, instead of staying flat as constant-LR SWA would.
+            run_dir = self._train_weight_avg_run(root, ema_decay=0.0, swa_start_pct=0.25, epochs=4, swa_lr=0.05)
+            history = pd.read_csv(run_dir / "history.csv")
+            lrs = history["lr"].tolist()
+            self.assertAlmostEqual(lrs[0], 0.01)  # epoch 1 trains at the base LR (logged pre-step)
+            self.assertGreater(lrs[-1], lrs[0])  # SWALR drove the LR up toward swa_lr
+            # The SWA average still checkpoints + reloads as a plain model that composes with TTA.
+            checkpoint = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
+            self.assertEqual(checkpoint["eval_model_kind"], "swa")
+            _, _, _, model = _load_checkpoint(run_dir / "best.pt", torch.device("cpu"))
+            with torch.no_grad():
+                prediction = model(make_context(batch_size=2, use_velocity=True))
+            self.assertEqual(tuple(prediction.shape), (2, 12, 11, 2))
+
     def test_repeat_trials_writes_aggregate_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -927,6 +1146,8 @@ num_examples = 1
             self.assertEqual(summary["protocol"], "repeat_trials")
             self.assertEqual(len(summary["trials"]), 2)
             self.assertIn("val_ade_mean", summary["aggregate"])
+            self.assertIn("val_ade_l2_mean", summary["aggregate"])
+            self.assertIn("val_fde_l2_mean", summary["aggregate"])
 
     def test_cross_validate_writes_fold_aggregate_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -990,6 +1211,307 @@ num_examples = 1
             self.assertEqual(summary["protocol"], "cross_validation")
             self.assertEqual(len(summary["folds"]), 3)
             self.assertIn("val_ade_mean", summary["aggregate"])
+            self.assertIn("val_ade_l2_mean", summary["aggregate"])
+            self.assertIn("val_fde_l2_mean", summary["aggregate"])
+
+
+class AuxiliaryLossWiringTests(unittest.TestCase):
+    def test_loss_section_defaults_to_zero_when_omitted(self) -> None:
+        config = make_config("e1_joint_gru")
+        self.assertEqual(config.loss.lambda_smooth, 0.0)
+        self.assertEqual(config.loss.lambda_boundary, 0.0)
+        self.assertEqual(config.loss.lambda_ball, 0.0)
+
+    def test_loss_section_parses_from_toml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "aux.toml"
+            config_path.write_text(
+                """
+[experiment]
+name = "aux"
+model_name = "e1_joint_gru"
+
+[loss]
+lambda_smooth = 0.01
+lambda_boundary = 0.02
+lambda_ball = 0.03
+ball_max_dist = 9.0
+"""
+            )
+            config, _ = load_config(config_path)
+            self.assertAlmostEqual(config.loss.lambda_smooth, 0.01)
+            self.assertAlmostEqual(config.loss.lambda_boundary, 0.02)
+            self.assertAlmostEqual(config.loss.lambda_ball, 0.03)
+            self.assertAlmostEqual(config.loss.ball_max_dist, 9.0)
+
+    def test_zero_lambdas_reproduce_pure_mse(self) -> None:
+        from nba_forecasting.config import LossSection
+        from nba_forecasting.data import Normalizer
+        from nba_forecasting.runner import _compute_training_loss
+
+        torch.manual_seed(0)
+        prediction = torch.randn(2, 12, 11, 2)
+        target = torch.randn(2, 12, 11, 2)
+        static = torch.stack([IS_PLAYER, TEAM_VALUES], dim=-1).unsqueeze(0).expand(2, 11, 2)
+        normalizer = Normalizer(mu=torch.zeros(2), sigma=torch.ones(2))
+
+        total, components = _compute_training_loss(prediction, target, {"static": static}, LossSection(), normalizer, torch.device("cpu"))
+        expected = normalized_mse_loss(prediction, target)
+        self.assertTrue(torch.allclose(total, expected))
+        self.assertEqual(components["smooth"], 0.0)
+        self.assertEqual(components["boundary"], 0.0)
+        self.assertEqual(components["ball"], 0.0)
+
+    def test_smooth_lambda_adds_weighted_term(self) -> None:
+        from nba_forecasting.config import LossSection
+        from nba_forecasting.data import Normalizer
+        from nba_forecasting.metrics import smoothness_loss
+        from nba_forecasting.runner import _compute_training_loss
+
+        torch.manual_seed(1)
+        prediction = torch.randn(2, 12, 11, 2)
+        target = torch.randn(2, 12, 11, 2)
+        static = torch.stack([IS_PLAYER, TEAM_VALUES], dim=-1).unsqueeze(0).expand(2, 11, 2)
+        normalizer = Normalizer(mu=torch.zeros(2), sigma=torch.ones(2))  # identity -> raw == pred
+
+        total, components = _compute_training_loss(
+            prediction,
+            target,
+            {"static": static},
+            LossSection(lambda_smooth=0.5),
+            normalizer,
+            torch.device("cpu"),
+        )
+        expected = normalized_mse_loss(prediction, target) + 0.5 * smoothness_loss(prediction)
+        self.assertTrue(torch.allclose(total, expected))
+        self.assertGreater(components["smooth"], 0.0)
+
+
+class _ConstantLastPosModel(torch.nn.Module):
+    """Predicts the last context position repeated over the horizon.
+
+    This map is *exactly* reflection-equivariant in normalized space, so it lets us test
+    the reflect -> forward -> invert -> average TTA pipeline end-to-end without relying on
+    a trained model being perfectly equivariant.
+    """
+
+    def __init__(self, horizon: int) -> None:
+        super().__init__()
+        self.horizon = horizon
+
+    def forward(self, context: torch.Tensor, **_unused) -> torch.Tensor:
+        last = context[:, -1, :, :2]
+        return last.unsqueeze(1).expand(-1, self.horizon, -1, -1).contiguous()
+
+
+class TtaPredictTests(unittest.TestCase):
+    def _setup(self) -> tuple[_ConstantLastPosModel, torch.Tensor, Normalizer]:
+        torch.manual_seed(0)
+        # Non-trivial normalizer so the reflection shift (2*mu/sigma) is non-zero.
+        normalizer = Normalizer(mu=torch.tensor([10.0, -5.0]), sigma=torch.tensor([3.0, 4.0]))
+        context = torch.randn(2, 8, 11, 6)  # [B, T, N, F] with velocity (channels 2,3)
+        model = _ConstantLastPosModel(horizon=12).eval()
+        return model, context, normalizer
+
+    def test_group_none_is_byte_identical_to_single_forward(self) -> None:
+        model, context, normalizer = self._setup()
+        out = _tta_predict(model, context, normalizer, "none", use_velocity=True)
+        self.assertTrue(torch.equal(out, model(context)))
+
+    def test_full_group_recovers_equivariant_prediction(self) -> None:
+        model, context, normalizer = self._setup()
+        baseline = model(context)
+        for group in ("y", "x", "xy"):
+            averaged = _tta_predict(model, context, normalizer, group, use_velocity=True)
+            self.assertEqual(averaged.shape, baseline.shape)
+            self.assertTrue(
+                torch.allclose(averaged, baseline, atol=1e-4),
+                f"TTA group {group!r} should recover the equivariant prediction",
+            )
+
+    def test_unknown_group_raises(self) -> None:
+        model, context, normalizer = self._setup()
+        with self.assertRaises(ValueError):
+            _tta_predict(model, context, normalizer, "diagonal", use_velocity=True)
+
+    def test_group_table_elements_start_with_identity(self) -> None:
+        for group, elements in TTA_GROUPS.items():
+            self.assertEqual(elements[0], (False, False), f"{group} must start with identity")
+
+
+class _ConstantOutputModel(torch.nn.Module):
+    """Emits a constant normalized prediction, independent of the input.
+
+    Lets the ensemble raw-space-average be checked against a hand-computed mean without
+    relying on a trained model.
+    """
+
+    def __init__(self, value: float, horizon: int, num_entities: int) -> None:
+        super().__init__()
+        self.value = value
+        self.horizon = horizon
+        self.num_entities = num_entities
+
+    def forward(self, context: torch.Tensor, **_unused) -> torch.Tensor:
+        batch = context.shape[0]
+        return torch.full((batch, self.horizon, self.num_entities, 2), self.value)
+
+
+def _save_tiny_checkpoint(path: Path, data_dir: Path, split: dict[str, list[int]]) -> None:
+    """Build a minimal `best.pt` (untrained e1_joint_gru) with a non-trivial normalizer."""
+    config = make_config("e1_joint_gru", data_dir=str(data_dir), use_velocity=True)
+    model = build_model(config)
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "config": config.to_dict(),
+            "split": split,
+            "normalizer": {"mu": [5.0, -3.0], "sigma": [2.0, 4.0]},
+            "best_metrics": {"ade": 0.0, "mse": 0.0, "rmse": 0.0},
+            "epoch": 0,
+        },
+        path,
+    )
+
+
+class EnsembleTests(unittest.TestCase):
+    def test_n1_submit_byte_identical_to_single_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            data_dir = write_synthetic_dataset(root, train_lengths=[20, 22, 24], test_count=2)
+            checkpoint = root / "best.pt"
+            _save_tiny_checkpoint(checkpoint, data_dir, {"train": [0, 1], "val": [2], "holdout": []})
+            single = submit_checkpoint(checkpoint, root / "single.csv", device_arg="cpu", tta_group="xy")
+            ensemble = submit_ensemble([checkpoint], root / "ensemble.csv", device_arg="cpu", tta_group="xy")
+            self.assertEqual(single.read_bytes(), ensemble.read_bytes())
+
+    def test_n1_evaluate_matches_single_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            data_dir = write_synthetic_dataset(root, train_lengths=[20, 22, 24], test_count=2)
+            checkpoint = root / "best.pt"
+            _save_tiny_checkpoint(checkpoint, data_dir, {"train": [0, 1], "val": [2], "holdout": []})
+            single_dir = evaluate_checkpoint(checkpoint, "val", root / "single_eval", device_arg="cpu", tta_group="xy")
+            ensemble_dir = evaluate_ensemble([checkpoint], "val", root / "ensemble_eval", device_arg="cpu", tta_group="xy")
+            single = json.loads((single_dir / "metrics.json").read_text())
+            ensemble = json.loads((ensemble_dir / "metrics.json").read_text())
+            for key in ("loss", "mse", "ade", "rmse", "ade_l2", "fde_l2"):
+                self.assertAlmostEqual(single[key], ensemble[key], places=4, msg=f"metric {key} diverged")
+            self.assertEqual(ensemble["tta_group"], "xy")
+            self.assertEqual(ensemble["ensemble_n"], 1)
+            self.assertEqual(len(ensemble["checkpoints"]), 1)
+
+    def test_two_model_raw_space_mean_shared_normalizer(self) -> None:
+        torch.manual_seed(0)
+        context = torch.randn(2, 8, 11, 6)
+        normalizer = Normalizer(mu=torch.tensor([10.0, -5.0]), sigma=torch.tensor([3.0, 4.0]))
+        model_a = _ConstantOutputModel(0.5, horizon=12, num_entities=11).eval()
+        model_b = _ConstantOutputModel(-1.5, horizon=12, num_entities=11).eval()
+        averaged = _ensemble_predict_raw(context, [(model_a, normalizer), (model_b, normalizer)], "none", use_velocity=True)
+        expected = 0.5 * (_denormalize_predictions(model_a(context), normalizer) + _denormalize_predictions(model_b(context), normalizer))
+        self.assertTrue(torch.allclose(averaged, expected, atol=1e-6))
+
+    def test_two_model_mean_uses_per_model_normalizer(self) -> None:
+        torch.manual_seed(0)
+        context = torch.randn(2, 8, 11, 6)
+        norm_a = Normalizer(mu=torch.tensor([10.0, -5.0]), sigma=torch.tensor([3.0, 4.0]))
+        norm_b = Normalizer(mu=torch.tensor([-2.0, 7.0]), sigma=torch.tensor([5.0, 2.0]))
+        model_a = _ConstantOutputModel(0.5, horizon=12, num_entities=11).eval()
+        model_b = _ConstantOutputModel(-1.5, horizon=12, num_entities=11).eval()
+        averaged = _ensemble_predict_raw(context, [(model_a, norm_a), (model_b, norm_b)], "none", use_velocity=True)
+        # Each leg must be denormalized with its OWN normalizer before averaging.
+        expected = 0.5 * (_denormalize_predictions(model_a(context), norm_a) + _denormalize_predictions(model_b(context), norm_b))
+        self.assertTrue(torch.allclose(averaged, expected, atol=1e-6))
+
+    def test_unknown_group_raises(self) -> None:
+        context = torch.randn(1, 8, 11, 6)
+        normalizer = Normalizer(mu=torch.tensor([0.0, 0.0]), sigma=torch.tensor([1.0, 1.0]))
+        model = _ConstantOutputModel(0.0, horizon=12, num_entities=11).eval()
+        with self.assertRaises(ValueError):
+            _ensemble_predict_raw(context, [(model, normalizer)], "diagonal", use_velocity=True)
+
+    def test_empty_checkpoint_list_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            submit_ensemble([], device_arg="cpu")
+
+
+def _build_mdn_e5(num_components: int, point_estimate: str = "mean"):
+    """A small MDN-head e5 graph transformer for unit tests."""
+    config = make_config("e5_graph_transformer", decoder_type="direct")
+    config.model.hidden_dim = 64
+    config.model.transformer_heads = 4
+    config.model.spatial_layers = 1
+    config.model.temporal_layers = 1
+    config.model.decoder_layers = 1
+    config.model.head_type = "mdn"
+    config.model.mdn_components = num_components
+    config.model.mdn_point_estimate = point_estimate
+    return build_model(config)
+
+
+class MdnHeadTests(unittest.TestCase):
+    """Phase 7 (D1): MDN head shapes, point-estimate reduction, default-off guard."""
+
+    def test_default_head_type_is_delta(self) -> None:
+        # The shipped default reproduces the deterministic head; no MDN unless opted in.
+        config = make_config("e5_graph_transformer", decoder_type="direct")
+        self.assertEqual(config.model.head_type, "delta")
+        model = build_model(config)
+        self.assertEqual(model.head_type, "delta")
+        with self.assertRaises(RuntimeError):
+            model.mixture_forward(make_context(batch_size=2, use_velocity=True))
+
+    def test_mdn_forward_returns_point_estimate_shape(self) -> None:
+        model = _build_mdn_e5(num_components=3)
+        context = make_context(batch_size=2, use_velocity=True)
+        output = model(context, future_xy=torch.randn(2, 12, 11, 2))
+        self.assertEqual(tuple(output.shape), (2, 12, 11, 2))
+        self.assertTrue(torch.isfinite(output).all())
+
+    def test_mixture_forward_shapes_and_normalized_weights(self) -> None:
+        model = _build_mdn_e5(num_components=4)
+        context = make_context(batch_size=2, use_velocity=True)
+        params = model.mixture_forward(context)
+        self.assertEqual(tuple(params.means.shape), (2, 12, 11, 4, 2))
+        self.assertEqual(tuple(params.log_sigma.shape), (2, 12, 11, 4, 2))
+        self.assertEqual(tuple(params.rho.shape), (2, 12, 11, 4))
+        self.assertEqual(tuple(params.log_pi.shape), (2, 11, 4))
+        self.assertTrue(torch.all(params.rho.abs() < 1.0))
+        weights = params.log_pi.exp().sum(dim=-1)
+        self.assertTrue(torch.allclose(weights, torch.ones_like(weights), atol=1e-5))
+
+    def test_forward_mean_matches_reduce_of_mixture(self) -> None:
+        model = _build_mdn_e5(num_components=3, point_estimate="mean")
+        context = make_context(batch_size=2, use_velocity=True)
+        params = model.mixture_forward(context)
+        expected = reduce_mixture(params.means, params.log_pi, "mean")
+        self.assertTrue(torch.allclose(model(context), expected, atol=1e-5))
+
+    def test_reduce_mixture_mean_and_mode(self) -> None:
+        means = torch.tensor([1.0, 1.0]).view(1, 1, 1, 1, 2).repeat(1, 1, 1, 2, 1)
+        means[..., 1, :] = 3.0
+        log_pi = torch.log(torch.tensor([[[0.25, 0.75]]]))
+        weighted = reduce_mixture(means, log_pi, "mean")
+        self.assertTrue(torch.allclose(weighted, torch.full((1, 1, 1, 2), 2.5), atol=1e-6))
+        top = reduce_mixture(means, log_pi, "mode")
+        self.assertTrue(torch.allclose(top, torch.full((1, 1, 1, 2), 3.0), atol=1e-6))
+
+    def test_reduce_mixture_unknown_mode_raises(self) -> None:
+        means = torch.zeros(1, 1, 1, 2, 2)
+        log_pi = torch.log_softmax(torch.zeros(1, 1, 2), dim=-1)
+        with self.assertRaises(ValueError):
+            reduce_mixture(means, log_pi, "median")
+
+    def test_invalid_head_type_and_point_estimate_raise(self) -> None:
+        bad_head = make_config("e5_graph_transformer", decoder_type="direct")
+        bad_head.model.head_type = "gaussian"
+        with self.assertRaises(ValueError):
+            build_model(bad_head)
+        bad_point = make_config("e5_graph_transformer", decoder_type="direct")
+        bad_point.model.head_type = "mdn"
+        bad_point.model.mdn_point_estimate = "median"
+        with self.assertRaises(ValueError):
+            build_model(bad_point)
 
 
 if __name__ == "__main__":

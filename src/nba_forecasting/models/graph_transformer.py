@@ -5,7 +5,7 @@ import math
 import torch
 from torch import nn
 
-from .common import TypeConditionedDeltaHead, _static_features
+from .common import MixtureDeltaHead, MixtureParams, TypeConditionedDeltaHead, _static_features, reduce_mixture
 from .graph_layers import _edge_features, _full_graph_mask, _knn_graph_mask, _radius_graph_mask, _semantic_graph_mask
 from .graph_prep_fused import graph_inputs_fused
 
@@ -132,13 +132,23 @@ class GraphTransformerForecastModel(nn.Module):
         decoder_layers: int,
         transformer_ffn_multiplier: float,
         graph_ablation_mode: str,
+        head_type: str = "delta",
+        mdn_components: int = 1,
+        mdn_point_estimate: str = "mean",
         graph_prep_backend: str = "torch",
     ) -> None:
         super().__init__()
         if graph_ablation_mode not in {"normal", "no_graph", "shuffled_graph"}:
             raise ValueError("graph_ablation_mode must be one of: normal, no_graph, shuffled_graph.")
+        if head_type not in {"delta", "mdn"}:
+            raise ValueError("head_type must be one of: delta, mdn.")
+        if mdn_point_estimate not in {"mean", "mode"}:
+            raise ValueError("mdn_point_estimate must be one of: mean, mode.")
         if graph_prep_backend not in {"torch", "fused"}:
             raise ValueError("graph_prep_backend must be one of: torch, fused.")
+        self.head_type = head_type
+        self.mdn_components = mdn_components
+        self.mdn_point_estimate = mdn_point_estimate
         self.num_entities = num_entities
         self.context_size = context_size
         self.horizon_size = horizon_size
@@ -190,7 +200,10 @@ class GraphTransformerForecastModel(nn.Module):
             for _ in range(decoder_layers)
         )
         self.decoder_input = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.delta_head = TypeConditionedDeltaHead(hidden_dim, dropout, separate_ball_head)
+        if head_type == "mdn":
+            self.delta_head = MixtureDeltaHead(hidden_dim, dropout, mdn_components)
+        else:
+            self.delta_head = TypeConditionedDeltaHead(hidden_dim, dropout, separate_ball_head)
 
     def _entity_embedding(self, static: torch.Tensor) -> torch.Tensor:
         if not self.use_entity_embeddings:
@@ -264,14 +277,13 @@ class GraphTransformerForecastModel(nn.Module):
         temporal = layer(temporal)
         return temporal.reshape(batch_size, num_entities, context_size, hidden_dim).permute(0, 2, 1, 3)
 
-    def forward(
-        self,
-        context: torch.Tensor,
-        future_xy: torch.Tensor | None = None,
-        teacher_forcing_prob: float = 0.0,
-        scheduled_sampling_prob: float = 0.0,
-    ) -> torch.Tensor:
-        del future_xy, teacher_forcing_prob, scheduled_sampling_prob
+    def _encode_decode(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Shared encoder + horizon decoder, head-agnostic.
+
+        Returns ``(flat_decoded [B*T, N, H], entity_state [B, N, H], static [B, N, 2],
+        last_pos [B, N, 2])``. Both the deterministic delta head and the MDN head consume
+        these; factoring it keeps the two heads byte-identical up to the final projection.
+        """
         batch_size, context_size, num_entities, _ = context.shape
         static = _static_features(context)
         flat_static = static.unsqueeze(1).expand(-1, context_size, -1, -1).reshape(batch_size * context_size, num_entities, 2)
@@ -304,6 +316,49 @@ class GraphTransformerForecastModel(nn.Module):
         )
         for layer in self.decoder_layers:
             flat_decoded = layer(flat_decoded, edge_feat, mask)
+        return flat_decoded, entity_state, static, context[:, -1, :, :2]
+
+    def _mixture_params(
+        self,
+        flat_decoded: torch.Tensor,
+        entity_state: torch.Tensor,
+        last_pos: torch.Tensor,
+    ) -> MixtureParams:
+        batch_size, num_entities, _ = entity_state.shape
+        mu_delta, log_sigma, rho, log_pi = self.delta_head(flat_decoded, entity_state, batch_size, self.horizon_size)
+        # Each mode's coherent trajectory = last position + cumsum of its per-step deltas.
+        means = last_pos.view(batch_size, 1, num_entities, 1, 2) + torch.cumsum(mu_delta, dim=1)
+        return MixtureParams(means=means, log_sigma=log_sigma, rho=rho, log_pi=log_pi)
+
+    def mixture_forward(
+        self,
+        context: torch.Tensor,
+        future_xy: torch.Tensor | None = None,
+        teacher_forcing_prob: float = 0.0,
+        scheduled_sampling_prob: float = 0.0,
+    ) -> MixtureParams:
+        """Full Gaussian-mixture parameters (MDN head only). Used by the NLL training loss
+        and the minADE_K evaluation pass; the deterministic pipeline uses ``forward``."""
+        del future_xy, teacher_forcing_prob, scheduled_sampling_prob
+        if self.head_type != "mdn":
+            raise RuntimeError("mixture_forward is only available when head_type == 'mdn'.")
+        flat_decoded, entity_state, _, last_pos = self._encode_decode(context)
+        return self._mixture_params(flat_decoded, entity_state, last_pos)
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        future_xy: torch.Tensor | None = None,
+        teacher_forcing_prob: float = 0.0,
+        scheduled_sampling_prob: float = 0.0,
+    ) -> torch.Tensor:
+        del future_xy, teacher_forcing_prob, scheduled_sampling_prob
+        batch_size, _, num_entities, _ = context.shape
+        flat_decoded, entity_state, static, last_pos = self._encode_decode(context)
+        if self.head_type == "mdn":
+            params = self._mixture_params(flat_decoded, entity_state, last_pos)
+            return reduce_mixture(params.means, params.log_pi, self.mdn_point_estimate)
+        decoder_static = static.unsqueeze(1).expand(-1, self.horizon_size, -1, -1)
         repeated_static = decoder_static.reshape(batch_size * self.horizon_size, num_entities, 2)
         deltas = self.delta_head(flat_decoded, repeated_static).reshape(batch_size, self.horizon_size, num_entities, 2)
-        return context[:, -1, :, :2].unsqueeze(1) + torch.cumsum(deltas, dim=1)
+        return last_pos.unsqueeze(1) + torch.cumsum(deltas, dim=1)

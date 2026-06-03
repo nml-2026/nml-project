@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.optim.swa_utils import AveragedModel
+from torch.optim.swa_utils import SWALR, AveragedModel
 from torch.utils.data import DataLoader, Dataset
 
 try:
@@ -25,7 +25,7 @@ try:
 except ImportError:  # pragma: no cover - fallback for minimal environments
     tqdm = None
 
-from .config import RunConfig, apply_overrides, load_config, resolve_config_paths
+from .config import LossSection, RunConfig, apply_overrides, load_config, resolve_config_paths
 from .data import (
     Normalizer,
     NotebookRandomWindowSampler,
@@ -36,10 +36,25 @@ from .data import (
     freeze_kfold_sequence_splits,
     freeze_sequence_split,
     load_sequences_from_dir_or_consolidated,
+    reflect_context,
+    reflect_prediction_xy,
+    reflect_shifts,
 )
-from .metrics import compute_raw_metrics, normalized_mse_loss, per_example_mse
+from .metrics import (
+    ball_plausibility_loss,
+    boundary_loss,
+    compute_raw_metrics,
+    min_ade_k,
+    min_fde_k,
+    mixture_nll,
+    normalized_mse_loss,
+    per_example_mse,
+    per_step_l2_error,
+    smoothness_loss,
+)
 from .models import build_model
-from .plots import save_history_plot, save_prediction_plot
+from .models.common import reduce_mixture
+from .plots import save_history_plot, save_per_step_error_plot, save_prediction_plot
 
 
 @dataclass(slots=True)
@@ -53,7 +68,7 @@ class ExampleRecord:
     static: torch.Tensor
 
 
-METRIC_KEYS = ("loss", "mse", "ade", "rmse")
+METRIC_KEYS = ("loss", "mse", "ade", "rmse", "ade_l2", "fde_l2")
 
 
 class ExponentialMovingAverage:
@@ -86,6 +101,38 @@ def _validation_model(
     if ema is not None:
         return ema.model, "ema"
     return model, "raw"
+
+
+def _build_lr_scheduler(
+    config: RunConfig,
+    optimizer: torch.optim.Optimizer,
+) -> torch.optim.lr_scheduler.LRScheduler | None:
+    """Epoch-level LR scheduler. Supports multistep, cosine, and cosine_warmup."""
+    kind = config.training.lr_scheduler
+
+    if kind == "none":
+        return None
+
+    if kind == "multistep":
+        return torch.optim.lr_scheduler.MultiStepLR(
+            optimizer,
+            milestones=config.training.lr_milestones,
+            gamma=config.training.lr_gamma,
+        )
+
+    epochs = max(1, config.training.epochs)
+    eta_min = config.training.lr_min
+
+    if kind == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=eta_min)
+
+    if kind == "cosine_warmup":
+        warmup = min(max(1, config.training.lr_warmup_epochs), epochs - 1) if epochs > 1 else 1
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup)
+        cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs - warmup), eta_min=eta_min)
+        return torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup])
+
+    raise ValueError(f"Unknown training.lr_scheduler {kind!r}. Expected one of: none, multistep, cosine, cosine_warmup.")
 
 
 def _progress_disabled() -> bool:
@@ -191,21 +238,6 @@ def _apply_optimization_backend(model: torch.nn.Module, backend: str) -> torch.n
     raise ValueError("optimization_backend must be one of: none, compile, compile_default, cudagraph.")
 
 
-def _build_lr_scheduler(
-    config: RunConfig,
-    optimizer: torch.optim.Optimizer,
-) -> torch.optim.lr_scheduler.LRScheduler | None:
-    if config.training.lr_scheduler == "none":
-        return None
-    if config.training.lr_scheduler == "multistep":
-        return torch.optim.lr_scheduler.MultiStepLR(
-            optimizer,
-            milestones=config.training.lr_milestones,
-            gamma=config.training.lr_gamma,
-        )
-    raise ValueError("training.lr_scheduler must be one of: none, multistep.")
-
-
 def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
@@ -266,6 +298,8 @@ def _build_dataloaders(
         sequence_ids: list[int],
         sampling_strategy: str,
         shuffle: bool,
+        reflect_prob: float = 0.0,
+        reflect_x_prob: float = 0.0,
     ) -> tuple[Dataset, DataLoader]:
         sequence_data = {seq_id: all_sequences[seq_id] for seq_id in sequence_ids}
         if sampling_strategy == "all_windows":
@@ -275,6 +309,9 @@ def _build_dataloaders(
                 context_size=config.experiment.context_size,
                 horizon_size=config.experiment.horizon_size,
                 use_velocity=config.features.use_velocity,
+                reflect_prob=reflect_prob,
+                reflect_x_prob=reflect_x_prob,
+                seed=config.experiment.seed,
             )
             loader = DataLoader(
                 dataset,
@@ -290,6 +327,9 @@ def _build_dataloaders(
                 context_size=config.experiment.context_size,
                 horizon_size=config.experiment.horizon_size,
                 use_velocity=config.features.use_velocity,
+                reflect_prob=reflect_prob,
+                reflect_x_prob=reflect_x_prob,
+                seed=config.experiment.seed,
             )
             loader = DataLoader(
                 dataset,
@@ -306,11 +346,15 @@ def _build_dataloaders(
         split["train"],
         config.training.train_window_sampling,
         shuffle=True,
+        reflect_prob=config.features.reflect_prob,
+        reflect_x_prob=config.features.reflect_x_prob,
     )
     val_dataset, val_loader = build_split_loader(
         split["val"],
         config.training.val_window_sampling,
         shuffle=False,
+        reflect_prob=0.0,
+        reflect_x_prob=0.0,
     )
     return train_dataset, val_dataset, train_loader, val_loader
 
@@ -319,6 +363,51 @@ def _denormalize_predictions(prediction: torch.Tensor, normalizer: Normalizer) -
     mu = normalizer.mu.to(prediction.device).view(1, 1, 1, 2)
     sigma = normalizer.sigma.to(prediction.device).view(1, 1, 1, 2)
     return prediction * sigma + mu
+
+
+# Dihedral test-time-augmentation groups: each element is (flip_x, flip_y). "none" is the
+# identity-only group, which short-circuits to a single forward (byte-identical default).
+TTA_GROUPS: dict[str, list[tuple[bool, bool]]] = {
+    "none": [(False, False)],
+    "y": [(False, False), (False, True)],
+    "x": [(False, False), (True, False)],
+    "xy": [(False, False), (True, False), (False, True), (True, True)],
+}
+
+
+def _tta_predict(
+    model: torch.nn.Module,
+    context: torch.Tensor,
+    normalizer: Normalizer,
+    tta_group: str,
+    use_velocity: bool,
+) -> torch.Tensor:
+    """Average normalized predictions over a dihedral group of court reflections.
+
+    For each group element ``g`` we reflect the context, forward the model, and apply the
+    inverse reflection to the predicted positions (the reflection is an involution, so the
+    same map inverts it), then average ``g^{-1} . f(g . x)`` over the group. Court
+    reflection is an exact isometry the model is ~equivariant to, so this is pure variance
+    reduction on the deterministic squared metric at ~|group|x inference cost.
+
+    The default ``"none"`` group is a single un-reflected forward, byte-identical to
+    ``model(context)``.
+    """
+    if tta_group not in TTA_GROUPS:
+        raise ValueError(f"Unknown TTA group {tta_group!r}. Expected one of {sorted(TTA_GROUPS)}.")
+    elements = TTA_GROUPS[tta_group]
+    if elements == [(False, False)]:
+        return model(context)
+    shift_x, shift_y = reflect_shifts(normalizer)
+    predictions: list[torch.Tensor] = []
+    for flip_x, flip_y in elements:
+        if flip_x or flip_y:
+            reflected = reflect_context(context, use_velocity, shift_x, shift_y, flip_x, flip_y)
+            output = reflect_prediction_xy(model(reflected), shift_x, shift_y, flip_x, flip_y)
+        else:
+            output = model(context)
+        predictions.append(output)
+    return torch.stack(predictions, dim=0).mean(dim=0)
 
 
 def _update_example_records(
@@ -353,9 +442,11 @@ def evaluate_model(
     num_examples: int = 0,
     max_batches: int | None = None,
     mixed_precision: bool = False,
+    tta_group: str = "none",
+    use_velocity: bool = True,
 ) -> tuple[dict[str, float], dict[str, list[ExampleRecord]]]:
     model.eval()
-    totals = {"loss": 0.0, "mse": 0.0, "ade": 0.0, "rmse": 0.0}
+    totals = {key: 0.0 for key in METRIC_KEYS}
     batches = 0
     best_examples: list[ExampleRecord] = []
     worst_examples: list[ExampleRecord] = []
@@ -371,7 +462,7 @@ def evaluate_model(
             context = batch["context"].to(device)
             target = batch["future_xy"].to(device)
             with _cuda_autocast(mixed_precision):
-                prediction = model(context)
+                prediction = _tta_predict(model, context, normalizer, tta_group, use_velocity)
                 loss = normalized_mse_loss(prediction, target)
             if not torch.isfinite(prediction).all():
                 raise FloatingPointError("Model produced NaN or Inf predictions during evaluation.")
@@ -398,6 +489,72 @@ def evaluate_model(
     return averaged, {"best": best_examples, "worst": worst_examples}
 
 
+def _compute_training_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    batch: dict[str, torch.Tensor],
+    loss_config: LossSection,
+    normalizer: Normalizer,
+    device: torch.device,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Combine the MSE objective with the (optional) physics-prior auxiliary terms.
+
+    The auxiliary terms are computed only when their weight is > 0, so the default
+    config (all lambdas 0) reproduces the pure-MSE path exactly and adds no cost.
+    Returns the scalar total loss plus a breakdown of component values for logging.
+    """
+    mse = normalized_mse_loss(prediction, target)
+    total = mse
+    components = {"mse": float(mse.item()), "smooth": 0.0, "boundary": 0.0, "ball": 0.0}
+
+    needs_raw = loss_config.lambda_smooth > 0.0 or loss_config.lambda_boundary > 0.0 or loss_config.lambda_ball > 0.0
+    if not needs_raw:
+        return total, components
+    prediction_raw = _denormalize_predictions(prediction, normalizer)
+
+    if loss_config.lambda_smooth > 0.0:
+        smooth = smoothness_loss(prediction_raw)
+        components["smooth"] = float(smooth.item())
+        total = total + loss_config.lambda_smooth * smooth
+    if loss_config.lambda_boundary > 0.0:
+        boundary = boundary_loss(
+            prediction_raw,
+            court_x_half=loss_config.court_x_half,
+            court_y_half=loss_config.court_y_half,
+            margin=loss_config.boundary_margin,
+        )
+        components["boundary"] = float(boundary.item())
+        total = total + loss_config.lambda_boundary * boundary
+    if loss_config.lambda_ball > 0.0:
+        ball = ball_plausibility_loss(
+            prediction_raw,
+            static=batch["static"].to(device),
+            max_dist=loss_config.ball_max_dist,
+        )
+        components["ball"] = float(ball.item())
+        total = total + loss_config.lambda_ball * ball
+    return total, components
+
+
+def _compute_mixture_loss(
+    params,
+    target: torch.Tensor,
+    point_estimate: str,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """MDN training objective: the Gaussian-mixture NLL (normalized space).
+
+    Returns the scalar NLL plus a component breakdown; the ``mse`` slot logs the
+    point-estimate MSE as a diagnostic comparable to the deterministic head's loss, with
+    the physics-prior slots zeroed (aux losses are not applied to the MDN head).
+    """
+    nll = mixture_nll(params, target)
+    with torch.no_grad():
+        point = reduce_mixture(params.means, params.log_pi, point_estimate)
+        point_mse = normalized_mse_loss(point, target)
+    components = {"mse": float(point_mse.item()), "smooth": 0.0, "boundary": 0.0, "ball": 0.0}
+    return nll, components
+
+
 def _train_one_epoch(
     model: torch.nn.Module,
     dataloader: DataLoader,
@@ -406,14 +563,17 @@ def _train_one_epoch(
     grad_clip: float,
     teacher_forcing_prob: float,
     scheduled_sampling_prob: float,
+    loss_config: LossSection,
+    normalizer: Normalizer,
     ema: ExponentialMovingAverage | None = None,
     max_batches: int | None = None,
     scaler: Any | None = None,
     mixed_precision: bool = False,
     timing_callback=None,
-) -> float:
+    mdn_point_estimate: str | None = None,
+) -> dict[str, float]:
     model.train()
-    total_loss = 0.0
+    totals = {"loss": 0.0, "mse": 0.0, "smooth": 0.0, "boundary": 0.0, "ball": 0.0}
     steps = 0
     total_batches = max_batches if max_batches is not None else len(dataloader)
     iterator = _progress_bar(
@@ -424,21 +584,31 @@ def _train_one_epoch(
     )
     for batch_idx, batch in iterator:
         if batch_idx == 1 and timing_callback is not None:
-            timing_callback("first_batch_retrieved")
+            timing_callback("first_step_start")
         context = batch["context"].to(device)
         target = batch["future_xy"].to(device)
-        if batch_idx == 1 and timing_callback is not None:
-            timing_callback("first_step_start")
+
         with _cuda_autocast(mixed_precision):
-            prediction = model(
-                context,
-                future_xy=target,
-                teacher_forcing_prob=teacher_forcing_prob,
-                scheduled_sampling_prob=scheduled_sampling_prob,
-            )
-            loss = normalized_mse_loss(prediction, target)
-        if not torch.isfinite(prediction).all():
-            raise FloatingPointError("Model produced NaN or Inf predictions during training.")
+            if mdn_point_estimate is not None:
+                params = model.mixture_forward(
+                    context,
+                    future_xy=target,
+                    teacher_forcing_prob=teacher_forcing_prob,
+                    scheduled_sampling_prob=scheduled_sampling_prob,
+                )
+                if not torch.isfinite(params.means).all():
+                    raise FloatingPointError("Model produced NaN or Inf mixture means during training.")
+                loss, components = _compute_mixture_loss(params, target, mdn_point_estimate)
+            else:
+                prediction = model(
+                    context,
+                    future_xy=target,
+                    teacher_forcing_prob=teacher_forcing_prob,
+                    scheduled_sampling_prob=scheduled_sampling_prob,
+                )
+                if not torch.isfinite(prediction).all():
+                    raise FloatingPointError("Model produced NaN or Inf predictions during training.")
+                loss, components = _compute_training_loss(prediction, target, batch, loss_config, normalizer, device)
         optimizer.zero_grad()
         if scaler is not None and mixed_precision:
             scaler.scale(loss).backward()
@@ -454,13 +624,15 @@ def _train_one_epoch(
             ema.update(model)
         if batch_idx == 1 and timing_callback is not None:
             timing_callback("first_forward_backward_optimizer_step_done", model_param_l2=_model_parameter_l2(model))
-        total_loss += float(loss.item())
+        totals["loss"] += float(loss.item())
+        for key, value in components.items():
+            totals[key] += value
         steps += 1
         if tqdm is not None and not _progress_disabled():
             iterator.set_postfix(loss=f"{loss.item():.4f}")
         if max_batches is not None and batch_idx >= max_batches:
             break
-    return total_loss / max(steps, 1)
+    return {key: value / max(steps, 1) for key, value in totals.items()}
 
 
 def _scheduled_sampling_probability(config: RunConfig, epoch: int) -> float:
@@ -514,6 +686,7 @@ def _training_checkpoint_payload(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: Any | None,
+    swa_scheduler: Any | None,
     scaler: Any | None,
     ema: ExponentialMovingAverage | None,
     swa_model: AveragedModel | None,
@@ -545,6 +718,8 @@ def _training_checkpoint_payload(
     }
     if lr_scheduler is not None:
         payload["lr_scheduler_state"] = lr_scheduler.state_dict()
+    if swa_scheduler is not None:
+        payload["swa_scheduler_state"] = swa_scheduler.state_dict()
     if scaler is not None:
         payload["scaler_state"] = scaler.state_dict()
     if ema is not None:
@@ -654,18 +829,24 @@ def train_experiment(
     ema = ExponentialMovingAverage(model, config.training.ema_decay) if config.training.ema_decay > 0.0 else None
     swa_model = AveragedModel(model) if config.training.swa_start_pct > 0.0 else None
     swa_start_epoch = max(1, int(config.training.epochs * config.training.swa_start_pct)) if swa_model else 0
+    swa_scheduler = (
+        SWALR(optimizer, swa_lr=config.training.swa_lr) if swa_model is not None and config.training.swa_lr is not None else None
+    )
     scaler = _cuda_grad_scaler(mixed_precision) if mixed_precision else None
     best_metric = float("inf")
     best_epoch = 0
     patience = 0
     history: list[dict[str, float]] = []
     start_epoch = 1
+
     if resume_state is not None and resume_path is not None:
         model.load_state_dict(resume_state["model_state"])
         if "optimizer_state" in resume_state:
             optimizer.load_state_dict(resume_state["optimizer_state"])
         if lr_scheduler is not None and "lr_scheduler_state" in resume_state:
             lr_scheduler.load_state_dict(resume_state["lr_scheduler_state"])
+        if swa_scheduler is not None and "swa_scheduler_state" in resume_state:
+            swa_scheduler.load_state_dict(resume_state["swa_scheduler_state"])
         if scaler is not None and "scaler_state" in resume_state:
             scaler.load_state_dict(resume_state["scaler_state"])
         if ema is not None and "ema_model_state" in resume_state:
@@ -679,6 +860,7 @@ def train_experiment(
         start_epoch = int(resume_state.get("epoch", 0)) + 1
         if timing_callback is not None:
             timing_callback("checkpoint_restore_done", path=str(resume_path), start_epoch=start_epoch)
+
     initial_param_l2 = _model_parameter_l2(model)
     if timing_callback is not None:
         timing_callback("initial_model_state", model_param_l2=initial_param_l2)
@@ -711,7 +893,7 @@ def train_experiment(
         if hasattr(val_loader.sampler, "set_epoch"):
             val_loader.sampler.set_epoch(epoch - 1)
         scheduled_sampling_prob = _scheduled_sampling_probability(config, epoch)
-        train_loss = _train_one_epoch(
+        train_metrics = _train_one_epoch(
             model=model,
             dataloader=train_loader,
             optimizer=optimizer,
@@ -719,21 +901,35 @@ def train_experiment(
             grad_clip=config.training.grad_clip,
             teacher_forcing_prob=config.training.teacher_forcing_prob,
             scheduled_sampling_prob=scheduled_sampling_prob,
+            loss_config=config.loss,
+            normalizer=normalizer,
             ema=ema,
             max_batches=_optional_batch_limit(config.training.max_train_batches),
             scaler=scaler,
             mixed_precision=mixed_precision,
             timing_callback=timing_callback if epoch == 1 else None,
+            mdn_point_estimate=(config.model.mdn_point_estimate if config.model.head_type == "mdn" else None),
         )
-        if swa_model is not None and epoch >= swa_start_epoch:
+        train_loss = train_metrics["loss"]
+        epoch_lr = optimizer.param_groups[0]["lr"]
+        in_swa_tail = swa_model is not None and epoch >= swa_start_epoch
+        if in_swa_tail:
             swa_model.update_parameters(model)
+
+        if in_swa_tail and swa_scheduler is not None:
+            swa_scheduler.step()
+        elif lr_scheduler is not None:
+            lr_scheduler.step()
+
         epoch_param_l2 = _model_parameter_l2(model)
+
         eval_model, eval_model_kind = _validation_model(
             model=model,
             ema=ema,
             swa_model=swa_model,
-            swa_active=swa_model is not None and epoch >= swa_start_epoch,
+            swa_active=in_swa_tail,
         )
+
         val_metrics, _ = evaluate_model(
             model=eval_model,
             dataloader=val_loader,
@@ -743,15 +939,22 @@ def train_experiment(
             max_batches=_optional_batch_limit(config.training.max_val_batches),
             mixed_precision=mixed_precision,
         )
+
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
+            "train_mse": train_metrics["mse"],
+            "train_smooth": train_metrics["smooth"],
+            "train_boundary": train_metrics["boundary"],
+            "train_ball": train_metrics["ball"],
             "val_loss": val_metrics["loss"],
             "val_mse": val_metrics["mse"],
             "val_ade": val_metrics["ade"],
             "val_rmse": val_metrics["rmse"],
+            "val_ade_l2": val_metrics["ade_l2"],
+            "val_fde_l2": val_metrics["fde_l2"],
             "scheduled_sampling_prob": scheduled_sampling_prob,
-            "lr": optimizer.param_groups[0]["lr"],
+            "lr": epoch_lr,
             "model_param_l2": epoch_param_l2,
             "model_param_l2_delta": epoch_param_l2 - initial_param_l2,
         }
@@ -794,13 +997,12 @@ def train_experiment(
             report_payload["checkpoint_metric"] = current_metric
             report_payload["run_dir"] = str(run_dir)
             epoch_reporter(report_payload)
-        if lr_scheduler is not None:
-            lr_scheduler.step()
         torch.save(
             _training_checkpoint_payload(
                 model=model,
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
+                swa_scheduler=swa_scheduler,
                 scaler=scaler,
                 ema=ema,
                 swa_model=swa_model,
@@ -829,6 +1031,8 @@ def train_experiment(
         "run_dir": str(run_dir),
         "ema_decay": config.training.ema_decay,
         "swa_start_pct": config.training.swa_start_pct,
+        "lr_scheduler": config.training.lr_scheduler,
+        "swa_lr": config.training.swa_lr,
         "mixed_precision": mixed_precision,
     }
     _write_json(run_dir / "train_summary.json", summary)
@@ -1020,17 +1224,86 @@ def _dataset_for_split(
     )
 
 
+def _compute_per_step_error(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    normalizer: Normalizer,
+    device: torch.device,
+    tta_group: str = "none",
+    use_velocity: bool = True,
+) -> list[float]:
+    model.eval()
+    total: torch.Tensor | None = None
+    batches = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            context = batch["context"].to(device)
+            prediction = _tta_predict(model, context, normalizer, tta_group, use_velocity)
+            prediction_raw = _denormalize_predictions(prediction, normalizer)
+            target_raw = batch["future_xy_raw"].to(device)
+            step_error = per_step_l2_error(prediction_raw, target_raw)
+            total = step_error if total is None else total + step_error
+            batches += 1
+    if total is None:
+        return []
+    return (total / batches).cpu().tolist()
+
+
+def _compute_mixture_metrics(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    normalizer: Normalizer,
+    device: torch.device,
+    num_components: int,
+) -> dict[str, float]:
+    """Marginal minADE_K / minFDE_K (feet) for an MDN checkpoint, eval-only.
+
+    Computed on the single-forward mixture modes (no TTA: reflection averaging has no
+    canonical mode ordering). Kept out of ``METRIC_KEYS``/history so the deterministic
+    aggregation paths are untouched, mirroring the Phase-0 per-step curve.
+    """
+    model.eval()
+    total_ade = 0.0
+    total_fde = 0.0
+    batches = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            context = batch["context"].to(device)
+            params = model.mixture_forward(context)
+            batch_size, horizon, num_entities, _, _ = params.means.shape
+            modes_flat = params.means.reshape(batch_size, horizon, num_entities * num_components, 2)
+            modes_raw = _denormalize_predictions(modes_flat, normalizer).reshape(batch_size, horizon, num_entities, num_components, 2)
+            target_raw = batch["future_xy_raw"].to(device)
+            total_ade += min_ade_k(modes_raw, target_raw)
+            total_fde += min_fde_k(modes_raw, target_raw)
+            batches += 1
+    divisor = max(batches, 1)
+    return {
+        "min_ade_k": total_ade / divisor,
+        "min_fde_k": total_fde / divisor,
+        "mdn_components": float(num_components),
+    }
+
+
 def evaluate_checkpoint(
     checkpoint_path: str | Path,
     split_name: str,
     output_dir: str | Path | None = None,
     device_arg: str = "auto",
+    tta_group: str = "none",
+    data_dir: str | Path | None = None,
 ) -> Path:
     device = resolve_device(device_arg)
     print("Using device:", device)
     checkpoint, config, normalizer, model = _load_checkpoint(checkpoint_path, device)
+
     mixed_precision = _mixed_precision_enabled(device, config.training.mixed_precision)
     print("Mixed precision:", "enabled" if mixed_precision else "disabled")
+
+    if data_dir is not None:
+        config.experiment.data_dir = str(Path(data_dir).resolve())
+
+    use_velocity = config.features.use_velocity
     dataset = _dataset_for_split(config, checkpoint, normalizer, split_name)
     dataloader = DataLoader(
         dataset,
@@ -1038,6 +1311,7 @@ def evaluate_checkpoint(
         shuffle=False,
         num_workers=config.training.num_workers,
     )
+
     metrics, examples = evaluate_model(
         model=model,
         dataloader=dataloader,
@@ -1045,10 +1319,28 @@ def evaluate_checkpoint(
         device=device,
         num_examples=config.evaluation.num_examples,
         mixed_precision=mixed_precision,
+        tta_group=tta_group,
+        use_velocity=use_velocity,
     )
-    base_dir = Path(output_dir) if output_dir else Path(checkpoint_path).resolve().parent / f"eval_{split_name}"
+    metrics["tta_group"] = tta_group
+
+    if config.model.head_type == "mdn":
+        metrics.update(_compute_mixture_metrics(model, dataloader, normalizer, device, config.model.mdn_components))
+
+    # Handle path generation with suffix consistency
+    suffix = f"_tta_{tta_group}" if tta_group != "none" else ""
+    if output_dir:
+        base_dir = Path(output_dir)
+    else:
+        base_dir = Path(checkpoint_path).resolve().parent / f"eval_{split_name}{suffix}"
+
     base_dir.mkdir(parents=True, exist_ok=True)
     _write_json(base_dir / "metrics.json", metrics)
+
+    per_step_error = _compute_per_step_error(model, dataloader, normalizer, device, tta_group=tta_group, use_velocity=use_velocity)
+    _write_json(base_dir / "per_step_error.json", {"ade_l2_per_step": per_step_error})
+    save_per_step_error_plot(per_step_error, base_dir / "per_step_error.png")
+
     for label, records in examples.items():
         for rank, record in enumerate(records, start=1):
             save_prediction_plot(
@@ -1059,6 +1351,7 @@ def evaluate_checkpoint(
                 static=record.static,
                 title=f"{label.title()} #{rank} | seq={record.sequence_id} start={record.start_idx} mse={record.error:.4f}",
             )
+
     return base_dir.resolve()
 
 
@@ -1072,16 +1365,21 @@ def submit_checkpoint(
     checkpoint_path: str | Path,
     output_path: str | Path | None = None,
     device_arg: str = "auto",
+    tta_group: str = "none",
+    data_dir: str | Path | None = None,
 ) -> Path:
     device = resolve_device(device_arg)
     print("Using device:", device)
     _, config, normalizer, model = _load_checkpoint(checkpoint_path, device)
     mixed_precision = _mixed_precision_enabled(device, config.training.mixed_precision)
     print("Mixed precision:", "enabled" if mixed_precision else "disabled")
+    if data_dir is not None:
+        config.experiment.data_dir = str(Path(data_dir).resolve())
+    use_velocity = config.features.use_velocity
     dataset = TestSequenceDataset(
         test_dir=Path(config.experiment.data_dir) / "test",
         normalizer=normalizer,
-        use_velocity=config.features.use_velocity,
+        use_velocity=use_velocity,
     )
     dataloader = DataLoader(dataset, batch_size=config.training.batch_size, shuffle=False, num_workers=0)
     rows: list[list[float]] = []
@@ -1089,7 +1387,7 @@ def submit_checkpoint(
         for batch in dataloader:
             context = batch["context"].to(device)
             with _cuda_autocast(mixed_precision):
-                prediction = model(context)
+                prediction = _tta_predict(model, context, normalizer, tta_group, use_velocity)
             prediction_raw = _denormalize_predictions(prediction, normalizer).cpu()
             for idx in range(prediction_raw.shape[0]):
                 seq_id = int(batch["sequence_id"][idx].item())
@@ -1104,6 +1402,198 @@ def submit_checkpoint(
         writer.writerow(columns)
         writer.writerows(rows)
     return output.resolve()
+
+
+def _normalize_predictions(prediction_raw: torch.Tensor, normalizer: Normalizer) -> torch.Tensor:
+    """Inverse of ``_denormalize_predictions`` (device-safe). Used for the ensemble's
+    normalized ``loss``/``mse`` keys; the headline raw metrics never go through this."""
+    mu = normalizer.mu.to(prediction_raw.device).view(1, 1, 1, 2)
+    sigma = normalizer.sigma.to(prediction_raw.device).view(1, 1, 1, 2)
+    return (prediction_raw - mu) / sigma
+
+
+def _load_ensemble(
+    checkpoint_paths: list[str | Path],
+    device: torch.device,
+) -> tuple[list[tuple[torch.nn.Module, Normalizer]], RunConfig, dict]:
+    """Load N checkpoints into eval-mode models on ``device``, once (not per batch).
+
+    Returns ``[(model, normalizer), ...]`` plus the FIRST checkpoint's ``(config, checkpoint)``
+    dict, which callers use to build the dataloader / resolve the frozen split (all legs share
+    it). Raises ``ValueError`` on an empty list or a horizon/entity-count mismatch (the latter
+    guards the gated e3 architecture-mix: every leg must emit the same prediction shape).
+    """
+    paths = list(checkpoint_paths)
+    if not paths:
+        raise ValueError("Ensemble requires at least one checkpoint path.")
+    models: list[tuple[torch.nn.Module, Normalizer]] = []
+    base_config: RunConfig | None = None
+    base_checkpoint: dict | None = None
+    base_shape: tuple[int, int] | None = None
+    for path in paths:
+        checkpoint, config, normalizer, model = _load_checkpoint(path, device)
+        shape = (config.experiment.horizon_size, config.experiment.num_entities)
+        if base_config is None:
+            base_config, base_checkpoint, base_shape = config, checkpoint, shape
+        elif shape != base_shape:
+            raise ValueError(
+                f"Ensemble member {str(path)!r} has (horizon, entities)={shape}, incompatible with the first member's {base_shape}."
+            )
+        models.append((model, normalizer))
+    assert base_config is not None and base_checkpoint is not None
+    return models, base_config, base_checkpoint
+
+
+def _ensemble_predict_raw(
+    context: torch.Tensor,
+    models_with_normalizers: list[tuple[torch.nn.Module, Normalizer]],
+    tta_group: str,
+    use_velocity: bool,
+) -> torch.Tensor:
+    """Average each model's TTA-averaged, denormalized prediction in RAW court space.
+
+    Per model: ``_denormalize_predictions(_tta_predict(...))`` using THAT model's own
+    normalizer, then mean over models. Robust even if normalizers differed; on the shared
+    frozen split (byte-identical normalizers) it equals "average normalized then denormalize
+    once". For N=1 it reduces to ``_denormalize_predictions(_tta_predict(...))``, byte-identical
+    to the single-model submit/evaluate paths. Returns raw ``[B, horizon, N, 2]``.
+    """
+    predictions: list[torch.Tensor] = []
+    for model, normalizer in models_with_normalizers:
+        prediction = _tta_predict(model, context, normalizer, tta_group, use_velocity)
+        predictions.append(_denormalize_predictions(prediction, normalizer))
+    averaged = torch.stack(predictions, dim=0).mean(dim=0)
+    if not torch.isfinite(averaged).all():
+        raise FloatingPointError("Ensemble produced NaN or Inf predictions.")
+    return averaged
+
+
+def _compute_ensemble_per_step_error(
+    models_with_normalizers: list[tuple[torch.nn.Module, Normalizer]],
+    dataloader: DataLoader,
+    tta_group: str,
+    use_velocity: bool,
+    device: torch.device,
+) -> list[float]:
+    total: torch.Tensor | None = None
+    batches = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            context = batch["context"].to(device)
+            prediction_raw = _ensemble_predict_raw(context, models_with_normalizers, tta_group, use_velocity)
+            target_raw = batch["future_xy_raw"].to(device)
+            step_error = per_step_l2_error(prediction_raw, target_raw)
+            total = step_error if total is None else total + step_error
+            batches += 1
+    if total is None:
+        return []
+    return (total / batches).cpu().tolist()
+
+
+def submit_ensemble(
+    checkpoints: list[str | Path],
+    output_path: str | Path | None = None,
+    device_arg: str = "auto",
+    tta_group: str = "xy",
+    data_dir: str | Path | None = None,
+) -> Path:
+    """Average N checkpoints' (each TTA-averaged) predictions and write one submission CSV.
+
+    Mirrors ``submit_checkpoint`` but over a list of checkpoints. N=1 is byte-identical to
+    ``submit_checkpoint`` with the same ``tta_group``.
+    """
+    device = resolve_device(device_arg)
+    print("Using device:", device)
+    models, config, _ = _load_ensemble(checkpoints, device)
+    if data_dir is not None:
+        config.experiment.data_dir = str(Path(data_dir).resolve())
+    use_velocity = config.features.use_velocity
+    dataset = TestSequenceDataset(
+        test_dir=Path(config.experiment.data_dir) / "test",
+        normalizer=models[0][1],
+        use_velocity=use_velocity,
+    )
+    dataloader = DataLoader(dataset, batch_size=config.training.batch_size, shuffle=False, num_workers=0)
+    rows: list[list[float]] = []
+    with torch.no_grad():
+        for batch in dataloader:
+            context = batch["context"].to(device)
+            prediction_raw = _ensemble_predict_raw(context, models, tta_group, use_velocity).cpu()
+            for idx in range(prediction_raw.shape[0]):
+                seq_id = int(batch["sequence_id"][idx].item())
+                rows.append([seq_id] + prediction_raw[idx].reshape(-1).tolist())
+    rows.sort(key=lambda row: row[0])
+    template_path = Path(config.experiment.data_dir) / "sample_submission.csv"
+    columns = _submission_columns(template_path)
+    output = Path(output_path) if output_path else Path(checkpoints[0]).resolve().parent / "ensemble_submission.csv"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(columns)
+        writer.writerows(rows)
+    return output.resolve()
+
+
+def evaluate_ensemble(
+    checkpoints: list[str | Path],
+    split_name: str,
+    output_dir: str | Path | None = None,
+    device_arg: str = "auto",
+    tta_group: str = "xy",
+    data_dir: str | Path | None = None,
+) -> Path:
+    """Evaluate an N-checkpoint ensemble (each TTA-averaged) on a split, writing metrics.
+
+    Mirrors ``evaluate_checkpoint``'s accumulation but averages raw predictions across models.
+    The raw ``ade``/``rmse``/``ade_l2``/``fde_l2`` are normalizer-independent and are the
+    headline numbers; the normalized ``loss``/``mse`` are reported under the first checkpoint's
+    normalizer (well-defined and, on the shared frozen split, the natural normalized loss).
+    N=1 reproduces ``evaluate_checkpoint``'s metrics. Uses the first checkpoint's config/split
+    to build the dataloader (all legs share the frozen split).
+    """
+    device = resolve_device(device_arg)
+    print("Using device:", device)
+    models, config, checkpoint = _load_ensemble(checkpoints, device)
+    if data_dir is not None:
+        config.experiment.data_dir = str(Path(data_dir).resolve())
+    use_velocity = config.features.use_velocity
+    normalizer = models[0][1]
+    dataset = _dataset_for_split(config, checkpoint, normalizer, split_name)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config.training.batch_size,
+        shuffle=False,
+        num_workers=config.training.num_workers,
+    )
+    totals = {key: 0.0 for key in METRIC_KEYS}
+    batches = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            context = batch["context"].to(device)
+            prediction_raw = _ensemble_predict_raw(context, models, tta_group, use_velocity)
+            target = batch["future_xy"].to(device)
+            loss = normalized_mse_loss(_normalize_predictions(prediction_raw, normalizer), target)
+            target_raw = batch["future_xy_raw"].to(device)
+            metrics = compute_raw_metrics(prediction_raw, target_raw)
+            totals["loss"] += float(loss.item())
+            for key, value in metrics.items():
+                totals[key] += value
+            batches += 1
+    averaged: dict[str, object] = {key: value / max(batches, 1) for key, value in totals.items()}
+    averaged["tta_group"] = tta_group
+    averaged["ensemble_n"] = len(models)
+    averaged["checkpoints"] = [str(Path(p).resolve()) for p in checkpoints]
+    suffix = f"_tta_{tta_group}" if tta_group != "none" else ""
+    if output_dir:
+        base_dir = Path(output_dir)
+    else:
+        base_dir = Path(checkpoints[0]).resolve().parent / f"eval_ensemble_{split_name}_n{len(models)}{suffix}"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(base_dir / "metrics.json", averaged)
+    per_step_error = _compute_ensemble_per_step_error(models, dataloader, tta_group, use_velocity, device)
+    _write_json(base_dir / "per_step_error.json", {"ade_l2_per_step": per_step_error})
+    save_per_step_error_plot(per_step_error, base_dir / "per_step_error.png")
+    return base_dir.resolve()
 
 
 def train_many_experiments(

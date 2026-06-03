@@ -24,6 +24,9 @@ NUM_SAMPLES="${NUM_SAMPLES:-16}"
 MAX_CONCURRENT_TRIALS="${MAX_CONCURRENT_TRIALS:-2}"
 CPUS_PER_TRIAL="${CPUS_PER_TRIAL:-19}"
 GPUS_PER_TRIAL="${GPUS_PER_TRIAL:-1}"
+# ASHA early-stopping knobs (grace period = min epochs before a trial can be culled).
+GRACE_PERIOD="${GRACE_PERIOD:-1}"
+REDUCTION_FACTOR="${REDUCTION_FACTOR:-2}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-${SLURM_CPUS_PER_TASK:-40}}"
 RAY_NUM_GPUS="${RAY_NUM_GPUS:-2}"
 TRACE_TRAINABLE="${TRACE_TRAINABLE:-0}"
@@ -32,6 +35,10 @@ ESTIMATE_TARGET_EPOCHS="${ESTIMATE_TARGET_EPOCHS:-}"
 EPOCHS="${EPOCHS:-}"
 MAX_TRAIN_BATCHES="${MAX_TRAIN_BATCHES:-}"
 MAX_VAL_BATCHES="${MAX_VAL_BATCHES:-}"
+# Space-separated extra `--search PATH=EXPR` specs (e.g. staged 1-D aux-loss sweeps),
+# and extra `--set KEY=VALUE` overrides (e.g. fixing already-tuned lambdas).
+EXTRA_SEARCH="${EXTRA_SEARCH:-}"
+EXTRA_SET="${EXTRA_SET:-}"
 
 mkdir -p "$RUN_ROOT" "$PROJECT_ROOT/.mplconfig" logs
 if [[ -z "${TMPDIR:-}" ]]; then
@@ -68,6 +75,16 @@ fi
 if [[ "$TRACE_TRAINABLE" == "1" ]]; then
   EXTRA_ARGS+=(--trace-trainable)
 fi
+if [[ -n "$EXTRA_SET" ]]; then
+  for kv in $EXTRA_SET; do
+    EXTRA_ARGS+=(--set "$kv")
+  done
+fi
+if [[ -n "$EXTRA_SEARCH" ]]; then
+  for spec in $EXTRA_SEARCH; do
+    EXTRA_ARGS+=(--search "$spec")
+  done
+fi
 
 python -m nba_forecasting tune \
   --config "$CONFIG" \
@@ -78,6 +95,8 @@ python -m nba_forecasting tune \
   --num-samples "$NUM_SAMPLES" \
   --search-alg optuna \
   --scheduler asha \
+  --grace-period "$GRACE_PERIOD" \
+  --reduction-factor "$REDUCTION_FACTOR" \
   --cpus-per-trial "$CPUS_PER_TRIAL" \
   --gpus-per-trial "$GPUS_PER_TRIAL" \
   --ray-num-cpus "$RAY_NUM_CPUS" \

@@ -226,3 +226,6 @@ data/
 .mplconfig/
 .DS_Store
 local/
+
+# WSL/Windows alternate-data-stream marker files
+*:Zone.Identifier

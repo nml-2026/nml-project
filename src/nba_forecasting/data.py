@@ -302,6 +302,116 @@ def _build_feature_tensor(seq: torch.Tensor, normalizer: Normalizer, use_velocit
     return torch.cat(features, dim=-1), raw_xy
 
 
+def _reflect_window(
+    context: torch.Tensor,
+    future_xy: torch.Tensor,
+    future_xy_raw: torch.Tensor,
+    context_raw_xy: torch.Tensor,
+    use_velocity: bool,
+    shift_x: float,
+    shift_y: float,
+    flip_x: bool,
+    flip_y: bool,
+) -> dict[str, torch.Tensor]:
+    """Apply a court reflection to one window (Phase 1 / C2 augmentation).
+
+    The dataset spans the full court with both attack directions in ~50/50 balance, so
+    both reflections are valid label-preserving plays: ``y -> -y`` is the left/right
+    mirror about the centerline, ``x -> -x`` reverses the attack direction. Applying each
+    independently with its own probability yields the full dihedral group {I, Rx, Ry,
+    RxRy}. Team/static labels are never flipped (basketball is symmetric under both).
+
+    Tensors passed in are views into cached per-sequence tensors, so we clone before
+    mutating. With ``n = (r - mu) / sigma``, mapping raw ``r -> -r`` along an axis gives
+    ``n -> -n - 2*mu/sigma`` (= ``-n - shift``); velocity is a difference of normalized
+    positions, so the shift cancels and that component simply negates.
+    """
+    context = context.clone()
+    future_xy = future_xy.clone()
+    future_xy_raw = future_xy_raw.clone()
+    context_raw_xy = context_raw_xy.clone()
+
+    # (position channel, velocity channel, shift) per axis: x -> 0/2, y -> 1/3.
+    axes: list[tuple[int, int, float]] = []
+    if flip_x:
+        axes.append((0, 2, shift_x))
+    if flip_y:
+        axes.append((1, 3, shift_y))
+    for pos_c, vel_c, shift in axes:
+        context[..., pos_c] = -context[..., pos_c] - shift
+        if use_velocity:
+            context[..., vel_c] = -context[..., vel_c]
+        future_xy[..., pos_c] = -future_xy[..., pos_c] - shift
+        future_xy_raw[..., pos_c] = -future_xy_raw[..., pos_c]
+        context_raw_xy[..., pos_c] = -context_raw_xy[..., pos_c]
+    return {
+        "context": context,
+        "future_xy": future_xy,
+        "future_xy_raw": future_xy_raw,
+        "context_raw_xy": context_raw_xy,
+    }
+
+
+def reflect_shifts(normalizer: Normalizer) -> tuple[float, float]:
+    """Normalized-space shift terms for an x/y court mirror.
+
+    With ``n = (r - mu) / sigma``, the raw mirror ``r -> -r`` maps ``n -> -n - shift``
+    where ``shift = 2*mu/sigma``. Returns ``(shift_x, shift_y)``; shared by the training
+    datasets and the inference-time TTA path so the algebra lives in one place.
+    """
+    shift_x = float(2.0 * normalizer.mu[0].item() / normalizer.sigma[0].item())
+    shift_y = float(2.0 * normalizer.mu[1].item() / normalizer.sigma[1].item())
+    return shift_x, shift_y
+
+
+def reflect_context(
+    context: torch.Tensor,
+    use_velocity: bool,
+    shift_x: float,
+    shift_y: float,
+    flip_x: bool,
+    flip_y: bool,
+) -> torch.Tensor:
+    """Reflect a context feature window (the input arm of ``_reflect_window``).
+
+    Position channels (0=x, 1=y) map ``n -> -n - shift``; the matching velocity channels
+    (2=x, 3=y) simply negate (the shift cancels in a difference of positions). Static
+    channels are untouched. Used by inference-time TTA; ``reflect_prob=0`` callers never
+    reach here.
+    """
+    context = context.clone()
+    if flip_x:
+        context[..., 0] = -context[..., 0] - shift_x
+        if use_velocity:
+            context[..., 2] = -context[..., 2]
+    if flip_y:
+        context[..., 1] = -context[..., 1] - shift_y
+        if use_velocity:
+            context[..., 3] = -context[..., 3]
+    return context
+
+
+def reflect_prediction_xy(
+    prediction: torch.Tensor,
+    shift_x: float,
+    shift_y: float,
+    flip_x: bool,
+    flip_y: bool,
+) -> torch.Tensor:
+    """Apply the (involutive) reflection to predicted normalized xy positions.
+
+    ``prediction`` has shape ``[..., 2]`` (channels 0=x, 1=y). The mirror ``n -> -n - shift``
+    is its own inverse, so the same operation that reflects the context input also maps a
+    prediction made in the reflected frame back to the original frame.
+    """
+    prediction = prediction.clone()
+    if flip_x:
+        prediction[..., 0] = -prediction[..., 0] - shift_x
+    if flip_y:
+        prediction[..., 1] = -prediction[..., 1] - shift_y
+    return prediction
+
+
 class SequenceWindowDataset(Dataset):
     def __init__(
         self,
@@ -310,12 +420,19 @@ class SequenceWindowDataset(Dataset):
         context_size: int,
         horizon_size: int,
         use_velocity: bool,
+        reflect_prob: float = 0.0,
+        reflect_x_prob: float = 0.0,
+        seed: int = 0,
     ) -> None:
         super().__init__()
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.window_size = context_size + horizon_size
         self.use_velocity = use_velocity
+        self.reflect_prob = reflect_prob
+        self.reflect_x_prob = reflect_x_prob
+        self._reflect_shift_x, self._reflect_shift_y = reflect_shifts(normalizer)
+        self._gen = torch.Generator().manual_seed(seed)
         self.sequences = sequence_paths
         self.samples: list[dict[str, torch.Tensor | int]] = []
         self.window_index: list[tuple[int, int]] = []
@@ -348,13 +465,33 @@ class SequenceWindowDataset(Dataset):
         raw_xy = sample["raw_xy"]
         context_end = start + self.context_size
         future_end = context_end + self.horizon_size
-        return {
-            "sequence_id": int(sample["sequence_id"]),
-            "start_idx": start,
+        window = {
             "context": features[start:context_end],
             "future_xy": features[context_end:future_end, :, :2],
             "future_xy_raw": raw_xy[context_end:future_end],
             "context_raw_xy": raw_xy[start:context_end],
+        }
+        flip_x = self.reflect_x_prob > 0.0 and torch.rand((), generator=self._gen).item() < self.reflect_x_prob
+        flip_y = self.reflect_prob > 0.0 and torch.rand((), generator=self._gen).item() < self.reflect_prob
+        if flip_x or flip_y:
+            window = _reflect_window(
+                window["context"],
+                window["future_xy"],
+                window["future_xy_raw"],
+                window["context_raw_xy"],
+                self.use_velocity,
+                self._reflect_shift_x,
+                self._reflect_shift_y,
+                flip_x,
+                flip_y,
+            )
+        return {
+            "sequence_id": int(sample["sequence_id"]),
+            "start_idx": start,
+            "context": window["context"],
+            "future_xy": window["future_xy"],
+            "future_xy_raw": window["future_xy_raw"],
+            "context_raw_xy": window["context_raw_xy"],
             "static": sample["static"],
         }
 
@@ -367,12 +504,19 @@ class NotebookSequenceDataset(Dataset):
         context_size: int,
         horizon_size: int,
         use_velocity: bool,
+        reflect_prob: float = 0.0,
+        reflect_x_prob: float = 0.0,
+        seed: int = 0,
     ) -> None:
         super().__init__()
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.window_size = context_size + horizon_size
         self.use_velocity = use_velocity
+        self.reflect_prob = reflect_prob
+        self.reflect_x_prob = reflect_x_prob
+        self._reflect_shift_x, self._reflect_shift_y = reflect_shifts(normalizer)
+        self._gen = torch.Generator().manual_seed(seed)
         self.sequences = sequence_paths
         self.samples: list[dict[str, torch.Tensor | int]] = []
         self.max_start: list[int] = []
@@ -406,13 +550,33 @@ class NotebookSequenceDataset(Dataset):
         raw_xy = sample["raw_xy"]
         context_end = start + self.context_size
         future_end = context_end + self.horizon_size
-        return {
-            "sequence_id": int(sample["sequence_id"]),
-            "start_idx": start,
+        window = {
             "context": features[start:context_end],
             "future_xy": features[context_end:future_end, :, :2],
             "future_xy_raw": raw_xy[context_end:future_end],
             "context_raw_xy": raw_xy[start:context_end],
+        }
+        flip_x = self.reflect_x_prob > 0.0 and torch.rand((), generator=self._gen).item() < self.reflect_x_prob
+        flip_y = self.reflect_prob > 0.0 and torch.rand((), generator=self._gen).item() < self.reflect_prob
+        if flip_x or flip_y:
+            window = _reflect_window(
+                window["context"],
+                window["future_xy"],
+                window["future_xy_raw"],
+                window["context_raw_xy"],
+                self.use_velocity,
+                self._reflect_shift_x,
+                self._reflect_shift_y,
+                flip_x,
+                flip_y,
+            )
+        return {
+            "sequence_id": int(sample["sequence_id"]),
+            "start_idx": start,
+            "context": window["context"],
+            "future_xy": window["future_xy"],
+            "future_xy_raw": window["future_xy_raw"],
+            "context_raw_xy": window["context_raw_xy"],
             "static": sample["static"],
         }
 

@@ -1,0 +1,23 @@
+extends = "e5_graph_transformer.toml"
+
+# RayTune best trial (job 2939488, val ADE = 7.2522) applied as a fixed config.
+# This is the clean Phase 1 ablation baseline: reflect_prob defaults to 0.0.
+
+[experiment]
+name = "e5_graph_transformer_tuned"
+model_name = "e5_graph_transformer"
+
+[model]
+hidden_dim = 256
+dropout = 0.0758
+k_neighbors = 3
+transformer_heads = 4
+spatial_layers = 3
+temporal_layers = 3
+decoder_layers = 1
+transformer_ffn_multiplier = 2.0
+
+[training]
+lr = 0.000349
+epochs = 50
+patience = 10
