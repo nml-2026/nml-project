@@ -4,7 +4,6 @@ repos:
     hooks:
       - id: check-added-large-files
         args: ["--maxkb=1024"]
-        exclude: ^references/.*\.pdf$
       - id: check-toml
       - id: check-yaml
       - id: end-of-file-fixer

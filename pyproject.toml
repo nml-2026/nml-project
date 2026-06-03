@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.11.18,<0.12"]
+build-backend = "uv_build"
 
 [project]
 name = "nba-trajectory-forecasting"
@@ -15,11 +15,22 @@ dependencies = [
   "pandas>=2.2",
   "ray[tune]>=2.52.1",
   "tomli>=2.0; python_version < '3.11'",
-  "torch>=2.0",
   "tqdm>=4.62",
 ]
 
 [project.optional-dependencies]
+cpu = [
+  "torch>=2.0",
+]
+cu121 = [
+  "torch>=2.0",
+]
+cu124 = [
+  "torch>=2.0",
+]
+cu128 = [
+  "torch>=2.0",
+]
 dev = [
   "pre-commit>=4.0",
   "pytest>=8.0",
@@ -28,10 +39,14 @@ dev = [
 
 [project.scripts]
 nba-forecast = "nba_forecasting.cli:main"
+nml = "nba_forecasting.cli:main"
 
 [tool.ruff]
 line-length = 140
 target-version = "py310"
+exclude = [
+  "local",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
@@ -40,8 +55,59 @@ ignore = ["E501"]
 [tool.ruff.lint.isort]
 known-first-party = ["nba_forecasting"]
 
-[tool.setuptools]
-package-dir = {"" = "src"}
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.uv.build-backend]
+module-name = "nba_forecasting"
+module-root = "src"
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "cu121" },
+  ],
+  [
+    { extra = "cpu" },
+    { extra = "cu124" },
+  ],
+  [
+    { extra = "cpu" },
+    { extra = "cu128" },
+  ],
+  [
+    { extra = "cu121" },
+    { extra = "cu124" },
+  ],
+  [
+    { extra = "cu121" },
+    { extra = "cu128" },
+  ],
+  [
+    { extra = "cu124" },
+    { extra = "cu128" },
+  ],
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu121", extra = "cu121" },
+  { index = "pytorch-cu124", extra = "cu124" },
+  { index = "pytorch-cu128", extra = "cu128" },
+]

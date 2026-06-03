@@ -39,12 +39,17 @@ temporal_layers = 2
 decoder_layers = 2
 transformer_ffn_multiplier = 2.0
 graph_ablation_mode = "normal"
+optimization_backend = "none"
+graph_prep_backend = "torch"
 
 [training]
 epochs = 20
 batch_size = 128
 lr = 0.001
 weight_decay = 0.0001
+lr_scheduler = "none"
+lr_milestones = []
+lr_gamma = 0.1
 grad_clip = 1.0
 num_workers = 0
 patience = 5
@@ -57,6 +62,7 @@ max_train_batches = 0
 max_val_batches = 0
 train_window_sampling = "all_windows"
 val_window_sampling = "all_windows"
+mixed_precision = true
 
 [evaluation]
 num_examples = 3

@@ -4,7 +4,7 @@ These notes summarize implementation ideas we plan to test. The papers remain re
 
 ## Social-Mamba
 
-Reference: `references/3412_Social_Mamba_Efficient_Hu.pdf`
+Reference: see [references](references.md).
 
 Implementation-relevant ideas:
 
@@ -20,7 +20,7 @@ Project mapping:
 
 ## GraphSSM
 
-Reference: `references/2406.00943v2.pdf`
+Reference: [GraphSSM](references.md#papers).
 
 Useful code reference: [EdisonLeeeee/GraphSSM](https://github.com/EdisonLeeeee/GraphSSM)
 
@@ -37,7 +37,7 @@ Project mapping:
 
 ## Message-Passing SSM
 
-Reference: `references/2505.18728v1.pdf`
+Reference: [Message-Passing State-Space Models](references.md#papers).
 
 Implementation-relevant ideas:
 
@@ -53,7 +53,7 @@ Project mapping:
 
 ## Graph-Mamba
 
-Reference: `references/2402.00789v1.pdf`
+Reference: [Graph-Mamba](references.md#papers).
 
 Useful code reference: [bowang-lab/Graph-Mamba](https://github.com/bowang-lab/Graph-Mamba)
 

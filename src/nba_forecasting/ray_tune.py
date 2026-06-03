@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import csv
 import json
+import os
 import re
 import shutil
+import socket
+import sys
 import tempfile
 import time
 from datetime import datetime
@@ -82,14 +86,13 @@ def _require_ray():
         from ray import tune
         from ray.tune import Checkpoint
         from ray.tune.schedulers import ASHAScheduler
-        from ray.tune.search import ConcurrencyLimiter
         from ray.tune.search.optuna import OptunaSearch
     except ImportError as exc:  # pragma: no cover - exercised only when Ray is missing
         raise RuntimeError(
             "Ray Tune is required for hyperparameter tuning. Install it with "
             '`pip install "ray[tune]>=2.52.1" "optuna>=3.6"` or sync the project environment first.'
         ) from exc
-    return ray, ray_train, tune, Checkpoint, ASHAScheduler, ConcurrencyLimiter, OptunaSearch
+    return ray, ray_train, tune, Checkpoint, ASHAScheduler, OptunaSearch
 
 
 def _parse_list(raw_body: str) -> list[object]:
@@ -141,6 +144,83 @@ def _build_search_space(search_specs: list[str], tune) -> tuple[dict[str, object
     return space, kinds
 
 
+class TrainableTimingTrace:
+    def __init__(self, root: str | Path, trial_name: str) -> None:
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", trial_name).strip("_") or "trial"
+        self.path = self.root / f"{safe_name}_{os.getpid()}.jsonl"
+        self.started_perf = time.perf_counter()
+        self.first_tune_report_seen = False
+
+    def mark(self, event: str, **extra: object) -> None:
+        payload = {
+            "event": event,
+            "elapsed_s": time.perf_counter() - self.started_perf,
+            "timestamp": datetime.now().isoformat(),
+            **extra,
+        }
+        with self.path.open("a") as handle:
+            handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+
+
+def _runtime_context(ray_module) -> dict[str, object]:
+    try:
+        gpu_ids = ray_module.get_gpu_ids()
+    except Exception as exc:  # pragma: no cover - depends on Ray runtime internals
+        gpu_ids = f"unavailable: {exc}"
+    try:
+        import torch
+
+        torch_context: dict[str, object] = {
+            "torch_version": torch.__version__,
+            "torch_cuda_version": torch.version.cuda,
+            "torch_cuda_is_available": torch.cuda.is_available(),
+            "torch_cuda_device_count": torch.cuda.device_count(),
+        }
+    except Exception as exc:  # pragma: no cover - diagnostic path
+        torch_context = {"torch_context_error": str(exc)}
+    return {
+        "pid": os.getpid(),
+        "hostname": socket.gethostname(),
+        "python_executable": sys.executable,
+        "virtual_env": os.environ.get("VIRTUAL_ENV", ""),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "ray_gpu_ids": gpu_ids,
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS", ""),
+        "mkl_num_threads": os.environ.get("MKL_NUM_THREADS", ""),
+        **torch_context,
+    }
+
+
+def _last_history_row(run_dir: str | Path) -> dict[str, object]:
+    history_path = Path(run_dir) / "history.csv"
+    if not history_path.exists():
+        return {}
+    with history_path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        return {}
+    parsed: dict[str, object] = {}
+    for key, value in rows[-1].items():
+        if value is None:
+            continue
+        try:
+            parsed[f"train_history_{key}"] = float(value)
+        except ValueError:
+            parsed[f"train_history_{key}"] = value
+    return parsed
+
+
+def _local_torch_cuda_device_count() -> int:
+    try:
+        import torch
+
+        return torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:
+        return 0
+
+
 def run_ray_tune_search(
     config_arg: str | Path,
     search_specs: list[str],
@@ -154,9 +234,18 @@ def run_ray_tune_search(
     gpus_per_trial: float = 0.0,
     max_concurrent_trials: int | None = 1,
     ray_address: str | None = None,
+    ray_num_cpus: int | None = None,
+    ray_num_gpus: int | None = None,
+    ray_temp_dir: str | Path | None = None,
+    tune_storage_path: str | Path | None = None,
+    trace_trainable: bool = False,
 ) -> Path:
-    ray, ray_train, tune, Checkpoint, ASHAScheduler, ConcurrencyLimiter, OptunaSearch = _require_ray()
-    from .runner import evaluate_checkpoint, train_experiment
+    # Ray 2.5x can auto-enable its uv runtime environment when it sees a
+    # pyproject.toml. Workers should inherit the already-activated .venv
+    # instead of creating a separate environment without the selected Torch extra.
+    os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
+
+    ray, ray_train, tune, Checkpoint, ASHAScheduler, OptunaSearch = _require_ray()
 
     started_at = datetime.now()
     started_perf = time.perf_counter()
@@ -169,8 +258,13 @@ def run_ray_tune_search(
     config = resolve_config_paths(config, config_path)
 
     base_name = config.experiment.name
-    output_root = Path(config.experiment.output_root) / "ray_tune" / base_name / _timestamp()
+    run_timestamp = _timestamp()
+    output_root = Path(config.experiment.output_root) / "ray_tune" / base_name / run_timestamp
     output_root.mkdir(parents=True, exist_ok=False)
+    tune_storage_root = Path(tune_storage_path).resolve() if tune_storage_path else output_root
+    tune_run_name = base_name if tune_storage_path is None else f"{base_name}_{run_timestamp}"
+    if tune_storage_path:
+        tune_storage_root.mkdir(parents=True, exist_ok=True)
     search_space, search_kinds = _build_search_space(search_specs, tune)
     metric_name = f"val_{config.experiment.checkpoint_metric}"
     if search_algorithm == "optuna" and "grid" in search_kinds:
@@ -179,43 +273,85 @@ def run_ray_tune_search(
         )
 
     def trainable(sampled_config: dict[str, object]) -> None:
+        try:
+            trial_name = ray_train.get_context().get_trial_name()
+        except Exception:
+            trial_name = f"trial_{os.getpid()}"
+        trace = TrainableTimingTrace(output_root / "trainable_timing", trial_name) if trace_trainable else None
+        if trace is not None:
+            trace.mark("trial_start", sampled_config=sampled_config)
+            trace.mark("heavy_imports_start")
+        from .runner import evaluate_checkpoint, train_experiment
+
+        if trace is not None:
+            trace.mark("heavy_imports_done")
+            trace.mark("runtime_context", **_runtime_context(ray))
+            trace.mark("checkpoint_restore_skipped")
         trial_overrides = {}
         trial_overrides.update(overrides or {})
         trial_overrides.update(sampled_config)
         trial_overrides["experiment.output_root"] = str(output_root / "trial_runs")
 
         def reporter(metrics: dict[str, object]) -> None:
+            if trace is not None and not trace.first_tune_report_seen:
+                trace.mark("first_tune_report_start", metrics=metrics)
             tune.report(metrics)
+            if trace is not None and not trace.first_tune_report_seen:
+                trace.mark("first_tune_report_done")
+                trace.first_tune_report_seen = True
 
-        run_dir = train_experiment(resolved_config_arg, overrides=trial_overrides, epoch_reporter=reporter)
+        run_dir = train_experiment(
+            resolved_config_arg,
+            overrides=trial_overrides,
+            epoch_reporter=reporter,
+            timing_callback=trace.mark if trace is not None else None,
+        )
         device_arg = str(trial_overrides.get("experiment.device", config.experiment.device))
+        if trace is not None:
+            trace.mark("final_checkpoint_restore_start", path=str(Path(run_dir) / "best.pt"))
         eval_dir = evaluate_checkpoint(Path(run_dir) / "best.pt", "val", device_arg=device_arg)
+        if trace is not None:
+            trace.mark("final_checkpoint_restore_done", path=str(Path(run_dir) / "best.pt"), eval_dir=str(eval_dir))
         final_metrics = json.loads((eval_dir / "metrics.json").read_text())
         report = {f"val_{key}": value for key, value in final_metrics.items()}
+        report.update(_last_history_row(run_dir))
         report["run_dir"] = str(run_dir)
         report["eval_dir"] = str(eval_dir)
         with tempfile.TemporaryDirectory() as checkpoint_dir:
             checkpoint_root = Path(checkpoint_dir)
+            if trace is not None:
+                trace.mark("ray_checkpoint_write_start", checkpoint_dir=str(checkpoint_root))
             shutil.copy2(Path(run_dir) / "best.pt", checkpoint_root / "best.pt")
             shutil.copy2(run_dir / "resolved_config.json", checkpoint_root / "resolved_config.json")
             tune.report(report, checkpoint=Checkpoint.from_directory(checkpoint_dir))
+            if trace is not None:
+                trace.mark("ray_checkpoint_write_done", checkpoint_dir=str(checkpoint_root))
 
     resources = {"cpu": cpus_per_trial}
     if gpus_per_trial > 0:
         resources["gpu"] = gpus_per_trial
+        local_gpu_count = _local_torch_cuda_device_count()
+        if local_gpu_count <= 0:
+            raise RuntimeError("Ray Tune requested GPU resources, but PyTorch cannot see any CUDA devices in the driver process.")
+        if ray_num_gpus is None:
+            ray_num_gpus = local_gpu_count
+        elif ray_num_gpus > local_gpu_count:
+            print(
+                f"warning: requested ray_num_gpus={ray_num_gpus}, but PyTorch sees only {local_gpu_count}; "
+                f"using ray_num_gpus={local_gpu_count} to avoid invalid CUDA_VISIBLE_DEVICES assignments."
+            )
+            ray_num_gpus = local_gpu_count
 
     search_alg = None
     if search_algorithm == "optuna":
         search_alg = OptunaSearch(metric=metric_name, mode="min")
-        if max_concurrent_trials is not None:
-            search_alg = ConcurrencyLimiter(search_alg, max_concurrent=max_concurrent_trials)
 
     tune_config = tune.TuneConfig(
         metric=metric_name,
         mode="min",
         num_samples=num_samples,
         search_alg=search_alg,
-        max_concurrent_trials=None if search_alg is not None else max_concurrent_trials,
+        max_concurrent_trials=max_concurrent_trials,
         scheduler=ASHAScheduler(
             max_t=config.training.epochs,
             grace_period=grace_period,
@@ -226,18 +362,28 @@ def run_ray_tune_search(
     )
 
     if not ray.is_initialized():
+        ray_init_kwargs = {
+            "include_dashboard": False,
+            "ignore_reinit_error": True,
+        }
+        if ray_num_cpus is not None:
+            ray_init_kwargs["num_cpus"] = ray_num_cpus
+        if ray_num_gpus is not None:
+            ray_init_kwargs["num_gpus"] = ray_num_gpus
+        if ray_temp_dir is not None:
+            ray_init_kwargs["_temp_dir"] = str(Path(ray_temp_dir).resolve())
         if ray_address:
-            ray.init(address=ray_address, ignore_reinit_error=True)
+            ray.init(address=ray_address, **ray_init_kwargs)
         else:
-            ray.init(include_dashboard=False, ignore_reinit_error=True)
+            ray.init(**ray_init_kwargs)
     try:
         tuner = tune.Tuner(
             tune.with_resources(trainable, resources=resources),
             param_space=search_space,
             tune_config=tune_config,
             run_config=tune.RunConfig(
-                name=base_name,
-                storage_path=str(output_root),
+                name=tune_run_name,
+                storage_path=str(tune_storage_root),
                 verbose=1,
             ),
         )
@@ -270,6 +416,12 @@ def run_ray_tune_search(
             "cpus_per_trial": cpus_per_trial,
             "gpus_per_trial": gpus_per_trial,
             "max_concurrent_trials": max_concurrent_trials,
+            "ray_num_cpus": ray_num_cpus,
+            "ray_num_gpus": ray_num_gpus,
+            "ray_temp_dir": None if ray_temp_dir is None else str(ray_temp_dir),
+            "tune_storage_path": str(tune_storage_root),
+            "tune_run_name": tune_run_name,
+            "trace_trainable": trace_trainable,
             "best_trial": {
                 "path": best_result.path,
                 "config": best_result.config,
@@ -277,6 +429,14 @@ def run_ray_tune_search(
             },
             "trials": rows,
         }
+        if tune_storage_path:
+            local_tune_dir = tune_storage_root / tune_run_name
+            persistent_tune_dir = output_root / "ray_results"
+            if local_tune_dir.exists():
+                if persistent_tune_dir.exists():
+                    shutil.rmtree(persistent_tune_dir)
+                shutil.copytree(local_tune_dir, persistent_tune_dir)
+            summary["copied_tune_results"] = str(persistent_tune_dir)
         (output_root / "ray_tune_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True, default=str))
     finally:
         ray.shutdown()

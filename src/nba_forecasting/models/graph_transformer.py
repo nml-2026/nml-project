@@ -7,10 +7,18 @@ from torch import nn
 
 from .common import TypeConditionedDeltaHead, _static_features
 from .graph_layers import _edge_features, _full_graph_mask, _knn_graph_mask, _radius_graph_mask, _semantic_graph_mask
+from .graph_prep_fused import graph_inputs_fused
 
 
 class GraphMultiheadAttention(nn.Module):
-    def __init__(self, hidden_dim: int, edge_dim: int, num_heads: int, dropout: float, use_edge_bias: bool = True) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        edge_dim: int,
+        num_heads: int,
+        dropout: float,
+        use_edge_bias: bool = True,
+    ) -> None:
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}.")
@@ -52,7 +60,13 @@ class GraphTransformerSpatialBlock(nn.Module):
     ) -> None:
         super().__init__()
         ffn_dim = int(hidden_dim * ffn_multiplier)
-        self.attention = GraphMultiheadAttention(hidden_dim, edge_dim, num_heads, dropout, use_edge_bias=use_edge_bias)
+        self.attention = GraphMultiheadAttention(
+            hidden_dim,
+            edge_dim,
+            num_heads,
+            dropout,
+            use_edge_bias=use_edge_bias,
+        )
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, ffn_dim),
@@ -63,12 +77,20 @@ class GraphTransformerSpatialBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)
 
     def forward(self, node_state: torch.Tensor, edge_feat: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        node_state = self.norm1(node_state + self.attention(node_state, edge_feat, mask))
-        return self.norm2(node_state + self.ffn(node_state))
+        attn_out = self.attention(node_state, edge_feat, mask)
+        node_state = self.norm1(node_state + attn_out)
+        ffn_out = self.ffn(node_state)
+        return self.norm2(node_state + ffn_out)
 
 
 class TemporalTransformerBlock(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float, ffn_multiplier: float) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+        ffn_multiplier: float,
+    ) -> None:
         super().__init__()
         ffn_dim = int(hidden_dim * ffn_multiplier)
         self.attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
@@ -84,7 +106,8 @@ class TemporalTransformerBlock(nn.Module):
     def forward(self, sequence: torch.Tensor) -> torch.Tensor:
         attended, _ = self.attention(sequence, sequence, sequence, need_weights=False)
         sequence = self.norm1(sequence + attended)
-        return self.norm2(sequence + self.ffn(sequence))
+        ffn_out = self.ffn(sequence)
+        return self.norm2(sequence + ffn_out)
 
 
 class GraphTransformerForecastModel(nn.Module):
@@ -109,10 +132,13 @@ class GraphTransformerForecastModel(nn.Module):
         decoder_layers: int,
         transformer_ffn_multiplier: float,
         graph_ablation_mode: str,
+        graph_prep_backend: str = "torch",
     ) -> None:
         super().__init__()
         if graph_ablation_mode not in {"normal", "no_graph", "shuffled_graph"}:
             raise ValueError("graph_ablation_mode must be one of: normal, no_graph, shuffled_graph.")
+        if graph_prep_backend not in {"torch", "fused"}:
+            raise ValueError("graph_prep_backend must be one of: torch, fused.")
         self.num_entities = num_entities
         self.context_size = context_size
         self.horizon_size = horizon_size
@@ -122,6 +148,7 @@ class GraphTransformerForecastModel(nn.Module):
         self.use_entity_embeddings = use_entity_embeddings
         self.edge_radius = edge_radius
         self.graph_ablation_mode = graph_ablation_mode
+        self.graph_prep_backend = graph_prep_backend
         edge_dim = 5 if use_semantic_flags else 3
         node_input_dim = input_dim + (entity_embedding_dim if use_entity_embeddings else 0)
         if use_entity_embeddings:
@@ -143,7 +170,13 @@ class GraphTransformerForecastModel(nn.Module):
             for _ in range(spatial_layers)
         )
         self.temporal_layers = nn.ModuleList(
-            TemporalTransformerBlock(hidden_dim, transformer_heads, dropout, transformer_ffn_multiplier) for _ in range(temporal_layers)
+            TemporalTransformerBlock(
+                hidden_dim,
+                transformer_heads,
+                dropout,
+                transformer_ffn_multiplier,
+            )
+            for _ in range(temporal_layers)
         )
         self.decoder_layers = nn.ModuleList(
             GraphTransformerSpatialBlock(
@@ -194,6 +227,16 @@ class GraphTransformerForecastModel(nn.Module):
         return mask
 
     def graph_inputs(self, positions: torch.Tensor, static: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.graph_prep_backend == "fused":
+            return graph_inputs_fused(
+                positions,
+                static,
+                k_neighbors=self.k_neighbors,
+                use_semantic_flags=self.use_semantic_flags,
+                dynamic_edges=self.dynamic_edges,
+                edge_radius=self.edge_radius,
+                ablation_mode=self.graph_ablation_mode,
+            )
         mask = self._base_graph_mask(positions, static)
         edge_feat = _edge_features(positions, static, self.use_semantic_flags)
         if self.graph_ablation_mode == "no_graph":
@@ -240,7 +283,12 @@ class GraphTransformerForecastModel(nn.Module):
         layer_count = max(len(self.spatial_layers), len(self.temporal_layers))
         for layer_idx in range(layer_count):
             if layer_idx < len(self.spatial_layers):
-                encoded = self._apply_spatial_layer(encoded, context[:, :, :, :2], static, self.spatial_layers[layer_idx])
+                encoded = self._apply_spatial_layer(
+                    encoded,
+                    context[:, :, :, :2],
+                    static,
+                    self.spatial_layers[layer_idx],
+                )
             if layer_idx < len(self.temporal_layers):
                 encoded = self._apply_temporal_layer(encoded, self.temporal_layers[layer_idx])
         entity_state = encoded[:, -1]

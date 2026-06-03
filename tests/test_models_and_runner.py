@@ -24,6 +24,7 @@ from nba_forecasting.models import build_model
 from nba_forecasting.models.graph_layers import MessagePassingSSMLayer, _distance_sorted_social_inputs
 from nba_forecasting.models.graph_transformer import GraphMultiheadAttention
 from nba_forecasting.runner import (
+    _build_lr_scheduler,
     cross_validate_experiment,
     repeat_trials_experiment,
     submit_checkpoint,
@@ -130,6 +131,25 @@ class ModelAndRunnerTests(unittest.TestCase):
         self.assertEqual(parse_override_value("1.25"), 1.25)
         self.assertEqual(parse_override_value("mps"), "mps")
 
+    def test_multistep_lr_scheduler_decays_at_configured_milestones(self) -> None:
+        config = make_config("e1_joint_gru", use_velocity=True)
+        config.training.lr = 0.01
+        config.training.lr_scheduler = "multistep"
+        config.training.lr_milestones = [1, 3]
+        config.training.lr_gamma = 0.5
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.lr)
+        scheduler = _build_lr_scheduler(config, optimizer)
+        self.assertIsNotNone(scheduler)
+
+        observed = []
+        for _ in range(4):
+            observed.append(optimizer.param_groups[0]["lr"])
+            optimizer.step()
+            scheduler.step()
+
+        self.assertEqual(observed, [0.01, 0.005, 0.005, 0.0025])
+
     def test_public_configs_load_and_build_models(self) -> None:
         config_paths = sorted((Path(__file__).parents[1] / "configs").glob("*.toml"))
         self.assertGreater(len(config_paths), 0)
@@ -138,6 +158,17 @@ class ModelAndRunnerTests(unittest.TestCase):
                 config, _ = load_config(config_path)
                 model = build_model(config)
                 self.assertIsInstance(model, torch.nn.Module)
+
+    def test_only_base_config_defines_task_window_shape(self) -> None:
+        config_paths = sorted((Path(__file__).parents[1] / "configs").glob("*.toml"))
+        offenders = []
+        for config_path in config_paths:
+            if config_path.name == "base.toml":
+                continue
+            text = config_path.read_text()
+            if "context_size" in text or "horizon_size" in text:
+                offenders.append(config_path.name)
+        self.assertEqual(offenders, [])
 
     def test_all_models_return_expected_shapes(self) -> None:
         for (
@@ -693,6 +724,84 @@ num_examples = 1
                 checkpoint["config"]["experiment"]["split_path"],
                 str((root / "artifacts" / "splits" / "default.json").resolve()),
             )
+            history = pd.read_csv(run_dir / "history.csv")
+            self.assertIn("model_param_l2", history.columns)
+            self.assertIn("model_param_l2_delta", history.columns)
+            self.assertTrue(math.isfinite(float(history["model_param_l2"].iloc[0])))
+
+    def test_train_experiment_writes_and_resumes_last_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            data_dir = write_synthetic_dataset(root, train_lengths=[20, 22, 24, 26, 28, 30], test_count=2)
+            config_path = root / "resume.toml"
+            config_path.write_text(
+                f"""
+[experiment]
+name = "resume"
+model_name = "e1_joint_gru"
+seed = 0
+data_dir = "{data_dir}"
+output_root = "{root / "runs"}"
+split_path = "{root / "artifacts" / "splits" / "default.json"}"
+device = "cpu"
+context_size = 8
+horizon_size = 12
+num_entities = 11
+checkpoint_metric = "ade"
+
+[features]
+use_velocity = true
+
+[model]
+hidden_dim = 32
+message_dim = 32
+num_layers = 1
+dropout = 0.0
+k_neighbors = 2
+use_semantic_flags = true
+dynamic_edges = true
+use_relation_types = false
+use_entity_embeddings = false
+entity_embedding_dim = 8
+decoder_type = "autoregressive"
+direct_decoder_heads = 2
+
+[training]
+epochs = 1
+batch_size = 4
+lr = 0.01
+weight_decay = 0.0
+grad_clip = 1.0
+num_workers = 0
+patience = 4
+log_every = 10
+teacher_forcing_prob = 0.0
+scheduled_sampling_final_prob = 0.0
+ema_decay = 0.0
+swa_start_pct = 0.0
+max_train_batches = 1
+max_val_batches = 1
+
+[evaluation]
+num_examples = 1
+"""
+            )
+            run_dir = train_experiment(str(config_path))
+            last_checkpoint = run_dir / "last.pt"
+            self.assertTrue(last_checkpoint.exists())
+            first_state = torch.load(last_checkpoint, map_location="cpu", weights_only=False)
+            self.assertEqual(first_state["epoch"], 1)
+            self.assertIn("optimizer_state", first_state)
+
+            resumed_run_dir = train_experiment(
+                str(config_path),
+                overrides={"training.epochs": 2},
+                resume_checkpoint=last_checkpoint,
+            )
+            self.assertEqual(resumed_run_dir, run_dir)
+            resumed_state = torch.load(last_checkpoint, map_location="cpu", weights_only=False)
+            self.assertEqual(resumed_state["epoch"], 2)
+            self.assertEqual(len(resumed_state["history"]), 2)
 
     def test_train_experiment_supports_ema_and_swa_checkpointing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

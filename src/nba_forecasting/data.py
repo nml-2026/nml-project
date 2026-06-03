@@ -45,6 +45,30 @@ def collect_sequence_paths(split_dir: str | Path) -> dict[int, Path]:
     return paths
 
 
+def consolidated_sequence_path(split_dir: str | Path) -> Path:
+    root = Path(split_dir)
+    return root.parent / f"{root.name}_consolidated.pt"
+
+
+def _load_consolidated_sequences(path: str | Path) -> dict[int, torch.Tensor]:
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(data, dict):
+        raise ValueError(f"Consolidated dataset must be a dict, got {type(data).__name__}: {path}")
+    return {int(seq_id): seq.float() for seq_id, seq in data.items()}
+
+
+def collect_sequence_ids(split_dir: str | Path) -> set[int]:
+    root = Path(split_dir)
+    consolidated_path = consolidated_sequence_path(root)
+    if consolidated_path.exists():
+        return set(_load_consolidated_sequences(consolidated_path))
+    if root.exists():
+        paths = sorted(root.glob("*.pt"), key=lambda value: int(value.stem))
+        if paths:
+            return {int(path.stem) for path in paths}
+    raise FileNotFoundError(f"No .pt files found under {root} and no consolidated file found at {consolidated_path}.")
+
+
 def _validate_split(split: dict[str, list[int]], available_ids: set[int]) -> None:
     seen: set[int] = set()
     for split_name in ("train", "val", "holdout"):
@@ -64,8 +88,7 @@ def _validate_split(split: dict[str, list[int]], available_ids: set[int]) -> Non
 def freeze_sequence_split(train_dir: str | Path, split_path: str | Path, seed: int = 0) -> dict[str, list[int]]:
     split_file = Path(split_path)
     split_file.parent.mkdir(parents=True, exist_ok=True)
-    sequence_paths = collect_sequence_paths(train_dir)
-    available_ids = set(sequence_paths)
+    available_ids = collect_sequence_ids(train_dir)
     if split_file.exists():
         split = json.loads(split_file.read_text())
         _validate_split(split, available_ids)
@@ -101,8 +124,7 @@ def freeze_kfold_sequence_splits(
     train_root = Path(train_dir)
     split_root = Path(output_dir)
     split_root.mkdir(parents=True, exist_ok=True)
-    sequence_paths = collect_sequence_paths(train_root)
-    available_ids = set(sequence_paths)
+    available_ids = collect_sequence_ids(train_root)
 
     if base_split_path is not None:
         base_split = freeze_sequence_split(train_root, base_split_path, seed=seed)
@@ -157,12 +179,105 @@ def freeze_kfold_sequence_splits(
     return fold_paths
 
 
-def compute_normalizer(sequence_paths: Iterable[Path]) -> Normalizer:
+def load_sequences_from_dir_or_consolidated(split_dir: str | Path) -> dict[int, torch.Tensor]:
+    """Loads all sequences from a split directory. If a consolidated file exists, loads it.
+    Otherwise, loads individual files, consolidates them, saves the consolidated file to parent dir, and returns it.
+    """
+    import time
+
+    split_dir = Path(split_dir)
+    consolidated_path = consolidated_sequence_path(split_dir)
+
+    if consolidated_path.exists():
+        try:
+            print(f"Loading consolidated dataset from {consolidated_path}...")
+            start_time = time.perf_counter()
+            data = _load_consolidated_sequences(consolidated_path)
+            elapsed = time.perf_counter() - start_time
+            print(f"Loaded consolidated dataset in {elapsed:.4f} seconds.")
+            return data
+        except Exception as e:
+            print(f"Warning: Failed to load consolidated file {consolidated_path} due to {e}. Falling back to individual files.")
+
+    print(f"Consolidated file not found or failed to load. Loading individual files from {split_dir}...")
+    start_time = time.perf_counter()
+    paths = collect_sequence_paths(split_dir)
+    loaded_data = {}
+    for seq_id, path in paths.items():
+        loaded_data[seq_id] = torch.load(path, map_location="cpu", weights_only=False).float()
+    elapsed = time.perf_counter() - start_time
+    print(f"Loaded {len(loaded_data)} individual files in {elapsed:.4f} seconds.")
+
+    try:
+        consolidated_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(loaded_data, consolidated_path)
+        print(f"Saved consolidated dataset to {consolidated_path}")
+    except Exception as e:
+        print(f"Warning: Failed to save consolidated file to {consolidated_path} due to {e}")
+
+    return loaded_data
+
+
+def consolidate_sequence_dir(split_dir: str | Path, output_path: str | Path | None = None, *, overwrite: bool = False) -> Path:
+    source_dir = Path(split_dir)
+    output = Path(output_path) if output_path is not None else consolidated_sequence_path(source_dir)
+    if output.exists() and not overwrite:
+        data = _load_consolidated_sequences(output)
+        if not data:
+            raise ValueError(f"Existing consolidated dataset is empty: {output}")
+        return output.resolve()
+
+    paths = collect_sequence_paths(source_dir)
+    data = {seq_id: torch.load(path, map_location="cpu", weights_only=False).float() for seq_id, path in paths.items()}
+    if not data:
+        raise FileNotFoundError(f"No sequences found under {source_dir}.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(data, output)
+    return output.resolve()
+
+
+def prepare_remote_dataset(
+    data_dir: str | Path = "data",
+    split_path: str | Path = "artifacts/splits/default_split.json",
+    *,
+    seed: int = 0,
+    overwrite: bool = False,
+) -> dict[str, object]:
+    root = Path(data_dir)
+    train_consolidated = consolidate_sequence_dir(root / "train", overwrite=overwrite)
+    test_consolidated = consolidate_sequence_dir(root / "test", overwrite=overwrite)
+    split = freeze_sequence_split(root / "train", split_path, seed=seed)
+    return {
+        "data_dir": str(root.resolve()),
+        "train_consolidated": str(train_consolidated),
+        "test_consolidated": str(test_consolidated),
+        "split_path": str(Path(split_path).resolve()),
+        "train_sequences": len(split["train"]),
+        "val_sequences": len(split["val"]),
+        "holdout_sequences": len(split["holdout"]),
+    }
+
+
+def _iter_sequences(sequences: Iterable[Path] | dict[int, torch.Tensor]) -> Iterable[tuple[int, torch.Tensor]]:
+    if isinstance(sequences, dict):
+        for seq_id, seq in sequences.items():
+            yield seq_id, seq.float()
+    else:
+        for path in sequences:
+            seq_id = int(path.stem)
+            seq = torch.load(path, map_location="cpu", weights_only=False).float()
+            yield seq_id, seq
+
+
+def compute_normalizer(sequences: Iterable[Path | torch.Tensor]) -> Normalizer:
     total_count = 0
     total_sum = torch.zeros(2, dtype=torch.float64)
     total_squared_sum = torch.zeros(2, dtype=torch.float64)
-    for path in sequence_paths:
-        seq = torch.load(path, map_location="cpu", weights_only=False).float()
+    for item in sequences:
+        if isinstance(item, torch.Tensor):
+            seq = item.float()
+        else:
+            seq = torch.load(item, map_location="cpu", weights_only=False).float()
         xy = seq[:, :, :2]
         total_count += xy.shape[0] * xy.shape[1]
         total_sum += xy.sum(dim=(0, 1), dtype=torch.float64)
@@ -190,7 +305,7 @@ def _build_feature_tensor(seq: torch.Tensor, normalizer: Normalizer, use_velocit
 class SequenceWindowDataset(Dataset):
     def __init__(
         self,
-        sequence_paths: Iterable[Path],
+        sequence_paths: Iterable[Path] | dict[int, torch.Tensor],
         normalizer: Normalizer,
         context_size: int,
         horizon_size: int,
@@ -201,15 +316,13 @@ class SequenceWindowDataset(Dataset):
         self.horizon_size = horizon_size
         self.window_size = context_size + horizon_size
         self.use_velocity = use_velocity
-        self.sequence_paths = list(sequence_paths)
+        self.sequences = sequence_paths
         self.samples: list[dict[str, torch.Tensor | int]] = []
         self.window_index: list[tuple[int, int]] = []
         self._load_sequences(normalizer)
 
     def _load_sequences(self, normalizer: Normalizer) -> None:
-        for path in self.sequence_paths:
-            seq_id = int(path.stem)
-            seq = torch.load(path, map_location="cpu", weights_only=False).float()
+        for seq_id, seq in _iter_sequences(self.sequences):
             if seq.shape[0] < self.window_size:
                 continue
             features, raw_xy = _build_feature_tensor(seq, normalizer, self.use_velocity)
@@ -249,7 +362,7 @@ class SequenceWindowDataset(Dataset):
 class NotebookSequenceDataset(Dataset):
     def __init__(
         self,
-        sequence_paths: Iterable[Path],
+        sequence_paths: Iterable[Path] | dict[int, torch.Tensor],
         normalizer: Normalizer,
         context_size: int,
         horizon_size: int,
@@ -260,15 +373,13 @@ class NotebookSequenceDataset(Dataset):
         self.horizon_size = horizon_size
         self.window_size = context_size + horizon_size
         self.use_velocity = use_velocity
-        self.sequence_paths = list(sequence_paths)
+        self.sequences = sequence_paths
         self.samples: list[dict[str, torch.Tensor | int]] = []
         self.max_start: list[int] = []
         self._load_sequences(normalizer)
 
     def _load_sequences(self, normalizer: Normalizer) -> None:
-        for path in self.sequence_paths:
-            seq_id = int(path.stem)
-            seq = torch.load(path, map_location="cpu", weights_only=False).float()
+        for seq_id, seq in _iter_sequences(self.sequences):
             if seq.shape[0] < self.window_size:
                 continue
             features, raw_xy = _build_feature_tensor(seq, normalizer, self.use_velocity)
@@ -334,17 +445,20 @@ class NotebookRandomWindowSampler(Sampler[tuple[int, int]]):
 
 
 class TestSequenceDataset(Dataset):
-    def __init__(self, test_dir: str | Path, normalizer: Normalizer, use_velocity: bool) -> None:
+    def __init__(self, test_dir: str | Path | dict[int, torch.Tensor], normalizer: Normalizer, use_velocity: bool) -> None:
         super().__init__()
-        self.sequence_paths = list(collect_sequence_paths(test_dir).values())
+        self.sequences = test_dir
         self.samples: list[dict[str, torch.Tensor | int]] = []
         self.use_velocity = use_velocity
         self._load_sequences(normalizer)
 
     def _load_sequences(self, normalizer: Normalizer) -> None:
-        for path in self.sequence_paths:
-            seq_id = int(path.stem)
-            seq = torch.load(path, map_location="cpu", weights_only=False).float()
+        if isinstance(self.sequences, str | Path):
+            sequences = load_sequences_from_dir_or_consolidated(self.sequences)
+        else:
+            sequences = self.sequences
+
+        for seq_id, seq in _iter_sequences(sequences):
             features, raw_xy = _build_feature_tensor(seq, normalizer, self.use_velocity)
             self.samples.append(
                 {

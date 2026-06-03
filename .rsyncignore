@@ -15,12 +15,11 @@ ENV/
 .mplconfig/
 logs/
 runs/
-data/
-/*.md
-artifacts/splits/
+data/train/
+data/test/
+local/
 artifacts/cv/
 
-references/
 presentation_work/
 .github/
 .pre-commit-config.yaml

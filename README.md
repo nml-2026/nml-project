@@ -11,35 +11,48 @@ Given 8 observed time steps for 10 NBA players plus the ball, the code predicts 
 - `docs/`: project notes for model families, paper-guided changes, and experiment planning
 - `tests/`: smoke and regression tests
 - `cluster/`: starter scripts for running experiments on SCITAS Izar
-- `references/`: assignment brief and project reference material
 - `data/`: local dataset location
 - `runs/`: local training outputs, ignored by git
 - `artifacts/`: generated splits and cross-validation metadata, ignored by git
 
 ## Setup
 
-Use Python 3.10 or newer. From the repository root:
+Use [uv](https://docs.astral.sh/uv/) for local, Izar, and remote-GPU environments. uv manages Python and all Python dependencies.
 
 ```bash
-python -m venv .venv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+For Windows and other systems, see the [uv installation docs](https://docs.astral.sh/uv/getting-started/installation/).
+
+From the repository root, create and check an environment:
+
+```bash
+cd /path/to/nml-project
+uv sync --extra cpu
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
+python -m nba_forecasting doctor
 ```
 
-For development checks, install the optional dev dependencies:
+For development checks:
 
 ```bash
-python -m pip install -e ".[dev]"
+uv sync --extra cpu --extra dev
+source .venv/bin/activate
+python -m pytest -q
 ```
 
-Run the test suite:
+Torch variants are selected by uv extras. The CUDA extras use explicit PyTorch wheel indexes in `pyproject.toml`:
 
 ```bash
-PYTHONPATH=src python -m pytest -q
+uv sync --extra cu121
+uv sync --extra cu124
+uv sync --extra cu128
+source .venv/bin/activate
+python -m nba_forecasting doctor --expect-cuda
 ```
 
-For SCITAS Izar setup and Slurm jobs, see [cluster/README.md](cluster/README.md).
+For SCITAS Izar setup and Slurm jobs, see [cluster/README.md](cluster/README.md). For remote GPU hosts, see [cluster/REMOTE_GPU.md](cluster/REMOTE_GPU.md).
 
 ## Local Data
 
@@ -64,30 +77,36 @@ Each `.pt` sequence has shape `L x 11 x 4`, with features:
 
 The first 8 time steps are the context window, and the target horizon is the next 12 time steps.
 
-When copying code to Izar with `rsync`, use `.rsyncignore` from the repository root:
+Before syncing to Izar or another remote GPU host, prepare the portable dataset artifacts locally:
 
 ```bash
-rsync -av --delete --exclude-from=.rsyncignore ./ izar:~/nml-project/
+python -m nba_forecasting prepare-data
 ```
 
-This excludes local data, git metadata, references, logs, runs, caches, and build artifacts. If the dataset needs to be refreshed on Izar, copy it explicitly:
+This creates:
 
-```bash
-rsync -av data/ izar:~/nml-project/data/
+```text
+data/train_consolidated.pt
+data/test_consolidated.pt
+artifacts/splits/default_split.json
 ```
+
+`default_split.json` is the frozen sequence-level train/validation/holdout split. It lives under `artifacts/` because it is generated from the local training sequence IDs, but it should be copied to every remote machine so all jobs reuse the same split.
+
+Remote sync instructions live in [cluster/README.md](cluster/README.md) for Izar and [cluster/REMOTE_GPU.md](cluster/REMOTE_GPU.md) for other GPU hosts.
 
 ## Common Commands
 
 Train one experiment:
 
 ```bash
-PYTHONPATH=src python -m nba_forecasting train --config e0_reference
+python -m nba_forecasting train --config e0_reference
 ```
 
 Evaluate a checkpoint:
 
 ```bash
-PYTHONPATH=src python -m nba_forecasting evaluate \
+python -m nba_forecasting evaluate \
   --checkpoint runs/e0_reference/<timestamp>/best.pt \
   --split val
 ```
@@ -95,7 +114,7 @@ PYTHONPATH=src python -m nba_forecasting evaluate \
 Generate a Kaggle submission:
 
 ```bash
-PYTHONPATH=src python -m nba_forecasting submit \
+python -m nba_forecasting submit \
   --checkpoint runs/e3_dynamic_graph_direct/<timestamp>/best.pt \
   --output submission.csv
 ```
@@ -103,7 +122,7 @@ PYTHONPATH=src python -m nba_forecasting submit \
 Run a short smoke training job on real data:
 
 ```bash
-PYTHONPATH=src python -m nba_forecasting train \
+python -m nba_forecasting train \
   --config e3_dynamic_graph_direct \
   --device auto \
   --epochs 1 \
@@ -114,12 +133,12 @@ PYTHONPATH=src python -m nba_forecasting train \
 Run repeated trials or cross-validation:
 
 ```bash
-PYTHONPATH=src python -m nba_forecasting repeat-trials \
+python -m nba_forecasting repeat-trials \
   --config e3_dynamic_graph_direct \
   --repeats 3 \
   --device auto
 
-PYTHONPATH=src python -m nba_forecasting cross-validate \
+python -m nba_forecasting cross-validate \
   --config e3_dynamic_graph_direct \
   --folds 5 \
   --device cpu
@@ -128,7 +147,7 @@ PYTHONPATH=src python -m nba_forecasting cross-validate \
 Run Ray Tune with Optuna search:
 
 ```bash
-PYTHONPATH=src python -m nba_forecasting tune \
+python -m nba_forecasting tune \
   --config e3_dynamic_graph_direct \
   --device auto \
   --search-profile graph \
@@ -138,15 +157,17 @@ PYTHONPATH=src python -m nba_forecasting tune \
   --max-concurrent-trials 1
 ```
 
+Benchmarking commands live in [docs/benchmarking.md](docs/benchmarking.md).
+
 Rank Tune and batch results, then export the best trial config:
 
 ```bash
-PYTHONPATH=src python -m nba_forecasting summarize-results \
+python -m nba_forecasting summarize-results \
   --root /scratch/izar/$USER/nba_forecasting \
   --format markdown \
   --output results.md
 
-PYTHONPATH=src python -m nba_forecasting export-best-config \
+python -m nba_forecasting export-best-config \
   --summary /scratch/izar/$USER/nba_forecasting/<jobid>/ray_tune/<config>/<timestamp>/ray_tune_summary.json \
   --output configs/tuned_<config>.toml
 ```

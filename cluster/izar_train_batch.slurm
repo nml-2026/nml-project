@@ -10,26 +10,33 @@
 #SBATCH --time=12:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --account=ee-452
+#SBATCH --mail-type=NONE
 
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/nml-project}"
+IZAR_MODULES="${IZAR_MODULES:-gcc/11.3.0 cuda/12.1.1}"
 RUN_ROOT="${RUN_ROOT:-/scratch/izar/$USER/nba_forecasting/$SLURM_JOB_ID}"
 CONFIGS="${CONFIGS:-e0_reference e1_joint_gru e1_social_ssm e3_dynamic_graph_direct e3_graph_ssm_no_social}"
+DEVICE="${DEVICE:-cuda}"
 SEEDS="${SEEDS:-0}"
 EPOCHS="${EPOCHS:-30}"
 BATCH_SIZE="${BATCH_SIZE:-192}"
 EVALUATE_SPLITS="${EVALUATE_SPLITS:-val holdout}"
-source "$PROJECT_ROOT/cluster/izar_env.sh"
 
 mkdir -p "$RUN_ROOT" "$PROJECT_ROOT/.mplconfig" logs
 
-load_izar_modules
-activate_izar_env
-configure_izar_threads
-check_izar_python
+module purge
+module load $IZAR_MODULES
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-1}}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-1}}"
+export MPLCONFIGDIR="$PROJECT_ROOT/.mplconfig"
+export PYTHONUNBUFFERED=1
 
 cd "$PROJECT_ROOT"
+source .venv/bin/activate
+
+python -m nba_forecasting doctor --expect-cuda
 
 read -r -a CONFIG_ARGS <<< "$CONFIGS"
 read -r -a SEED_ARGS <<< "$SEEDS"

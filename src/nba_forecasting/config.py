@@ -91,6 +91,8 @@ class ModelSection:
     decoder_layers: int = 2
     transformer_ffn_multiplier: float = 2.0
     graph_ablation_mode: str = "normal"
+    optimization_backend: str = "none"
+    graph_prep_backend: str = "torch"
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> ModelSection:
@@ -103,6 +105,9 @@ class TrainingSection:
     batch_size: int = 128
     lr: float = 1e-3
     weight_decay: float = 1e-4
+    lr_scheduler: str = "none"
+    lr_milestones: list[int] = field(default_factory=list)
+    lr_gamma: float = 0.1
     grad_clip: float = 1.0
     num_workers: int = 0
     patience: int = 8
@@ -115,6 +120,7 @@ class TrainingSection:
     max_val_batches: int | None = None
     train_window_sampling: str = "all_windows"
     val_window_sampling: str = "all_windows"
+    mixed_precision: bool = True
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> TrainingSection:

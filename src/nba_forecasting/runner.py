@@ -8,10 +8,13 @@ import random
 import shutil
 import statistics
 import sys
+import time
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch.optim.swa_utils import AveragedModel
@@ -29,10 +32,10 @@ from .data import (
     NotebookSequenceDataset,
     SequenceWindowDataset,
     TestSequenceDataset,
-    collect_sequence_paths,
     compute_normalizer,
     freeze_kfold_sequence_splits,
     freeze_sequence_split,
+    load_sequences_from_dir_or_consolidated,
 )
 from .metrics import compute_raw_metrics, normalized_mse_loss, per_example_mse
 from .models import build_model
@@ -104,11 +107,50 @@ def _progress_bar(iterable, *, total: int | None, desc: str, leave: bool = False
     )
 
 
+def _mixed_precision_enabled(device: torch.device, requested: bool) -> bool:
+    return requested and device.type == "cuda"
+
+
+def _cuda_autocast(enabled: bool):
+    if not enabled:
+        return nullcontext()
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast("cuda")
+    return torch.cuda.amp.autocast()
+
+
+def _cuda_grad_scaler(enabled: bool) -> Any:
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _model_parameter_l2(model: torch.nn.Module) -> float:
+    total = 0.0
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.is_floating_point():
+                total += float(parameter.detach().float().square().sum().item())
+    return total**0.5
+
+
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps" and hasattr(torch.mps, "synchronize"):
+        torch.mps.synchronize()
+
+
 def resolve_device(device_arg: str) -> torch.device:
     if device_arg == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     if device_arg == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is not available in this environment.")
+        raise RuntimeError(
+            "CUDA was requested but is not available in this environment. "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}, "
+            f"torch.version.cuda={torch.version.cuda!r}, "
+            f"torch.cuda.device_count()={torch.cuda.device_count()}."
+        )
     if device_arg == "mps" and not torch.backends.mps.is_available():
         raise RuntimeError("MPS was requested but is not available in this environment.")
     return torch.device(device_arg)
@@ -119,6 +161,49 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _configure_torch_dynamo_for_compile() -> None:
+    """Raise Dynamo cache limits so graph-transformer forward does not thrash recompiles."""
+    import torch._dynamo
+
+    if torch._dynamo.config.cache_size_limit < 64:
+        torch._dynamo.config.cache_size_limit = 64
+    accumulated = getattr(torch._dynamo.config, "accumulated_cache_size_limit", None)
+    if isinstance(accumulated, int) and accumulated < 256:
+        torch._dynamo.config.accumulated_cache_size_limit = 256
+
+
+def _apply_optimization_backend(model: torch.nn.Module, backend: str) -> torch.nn.Module:
+    if backend == "none":
+        return model
+    if backend == "compile":
+        _configure_torch_dynamo_for_compile()
+        return torch.compile(model, mode="reduce-overhead")
+    if backend == "compile_default":
+        _configure_torch_dynamo_for_compile()
+        return torch.compile(model, mode="default")
+    if backend == "cudagraph":
+        raise NotImplementedError(
+            "optimization_backend='cudagraph' requires static-buffer training-loop capture and is not wired yet. "
+            "Use optimization_backend='compile' for CUDA Graph based reduce-overhead capture."
+        )
+    raise ValueError("optimization_backend must be one of: none, compile, compile_default, cudagraph.")
+
+
+def _build_lr_scheduler(
+    config: RunConfig,
+    optimizer: torch.optim.Optimizer,
+) -> torch.optim.lr_scheduler.LRScheduler | None:
+    if config.training.lr_scheduler == "none":
+        return None
+    if config.training.lr_scheduler == "multistep":
+        return torch.optim.lr_scheduler.MultiStepLR(
+            optimizer,
+            milestones=config.training.lr_milestones,
+            gamma=config.training.lr_gamma,
+        )
+    raise ValueError("training.lr_scheduler must be one of: none, multistep.")
 
 
 def _timestamp() -> str:
@@ -163,18 +248,18 @@ def _read_json(path: str | Path) -> dict:
     return json.loads(Path(path).read_text())
 
 
-def _prepare_split_and_normalizer(config: RunConfig) -> tuple[dict[str, list[int]], dict[int, Path], Normalizer]:
+def _prepare_split_and_normalizer(config: RunConfig) -> tuple[dict[str, list[int]], dict[int, torch.Tensor], Normalizer]:
     train_dir = Path(config.experiment.data_dir) / "train"
     split = freeze_sequence_split(train_dir, config.experiment.split_path, seed=config.experiment.seed)
-    all_paths = collect_sequence_paths(train_dir)
-    normalizer = compute_normalizer(all_paths[seq_id] for seq_id in split["train"])
-    return split, all_paths, normalizer
+    all_sequences = load_sequences_from_dir_or_consolidated(train_dir)
+    normalizer = compute_normalizer(all_sequences[seq_id] for seq_id in split["train"])
+    return split, all_sequences, normalizer
 
 
 def _build_dataloaders(
     config: RunConfig,
     split: dict[str, list[int]],
-    all_paths: dict[int, Path],
+    all_sequences: dict[int, torch.Tensor],
     normalizer: Normalizer,
 ) -> tuple[Dataset, Dataset, DataLoader, DataLoader]:
     def build_split_loader(
@@ -182,10 +267,10 @@ def _build_dataloaders(
         sampling_strategy: str,
         shuffle: bool,
     ) -> tuple[Dataset, DataLoader]:
-        sequence_paths = [all_paths[seq_id] for seq_id in sequence_ids]
+        sequence_data = {seq_id: all_sequences[seq_id] for seq_id in sequence_ids}
         if sampling_strategy == "all_windows":
             dataset = SequenceWindowDataset(
-                sequence_paths=sequence_paths,
+                sequence_paths=sequence_data,
                 normalizer=normalizer,
                 context_size=config.experiment.context_size,
                 horizon_size=config.experiment.horizon_size,
@@ -200,7 +285,7 @@ def _build_dataloaders(
             return dataset, loader
         if sampling_strategy == "random_window_per_sequence":
             dataset = NotebookSequenceDataset(
-                sequence_paths=sequence_paths,
+                sequence_paths=sequence_data,
                 normalizer=normalizer,
                 context_size=config.experiment.context_size,
                 horizon_size=config.experiment.horizon_size,
@@ -267,6 +352,7 @@ def evaluate_model(
     device: torch.device,
     num_examples: int = 0,
     max_batches: int | None = None,
+    mixed_precision: bool = False,
 ) -> tuple[dict[str, float], dict[str, list[ExampleRecord]]]:
     model.eval()
     totals = {"loss": 0.0, "mse": 0.0, "ade": 0.0, "rmse": 0.0}
@@ -284,10 +370,11 @@ def evaluate_model(
         for batch_idx, batch in iterator:
             context = batch["context"].to(device)
             target = batch["future_xy"].to(device)
-            prediction = model(context)
+            with _cuda_autocast(mixed_precision):
+                prediction = model(context)
+                loss = normalized_mse_loss(prediction, target)
             if not torch.isfinite(prediction).all():
                 raise FloatingPointError("Model produced NaN or Inf predictions during evaluation.")
-            loss = normalized_mse_loss(prediction, target)
             prediction_raw = _denormalize_predictions(prediction, normalizer)
             target_raw = batch["future_xy_raw"].to(device)
             metrics = compute_raw_metrics(prediction_raw, target_raw)
@@ -321,6 +408,9 @@ def _train_one_epoch(
     scheduled_sampling_prob: float,
     ema: ExponentialMovingAverage | None = None,
     max_batches: int | None = None,
+    scaler: Any | None = None,
+    mixed_precision: bool = False,
+    timing_callback=None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -333,23 +423,37 @@ def _train_one_epoch(
         leave=False,
     )
     for batch_idx, batch in iterator:
+        if batch_idx == 1 and timing_callback is not None:
+            timing_callback("first_batch_retrieved")
         context = batch["context"].to(device)
         target = batch["future_xy"].to(device)
-        prediction = model(
-            context,
-            future_xy=target,
-            teacher_forcing_prob=teacher_forcing_prob,
-            scheduled_sampling_prob=scheduled_sampling_prob,
-        )
+        if batch_idx == 1 and timing_callback is not None:
+            timing_callback("first_step_start")
+        with _cuda_autocast(mixed_precision):
+            prediction = model(
+                context,
+                future_xy=target,
+                teacher_forcing_prob=teacher_forcing_prob,
+                scheduled_sampling_prob=scheduled_sampling_prob,
+            )
+            loss = normalized_mse_loss(prediction, target)
         if not torch.isfinite(prediction).all():
             raise FloatingPointError("Model produced NaN or Inf predictions during training.")
-        loss = normalized_mse_loss(prediction, target)
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
+        if scaler is not None and mixed_precision:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
         if ema is not None:
             ema.update(model)
+        if batch_idx == 1 and timing_callback is not None:
+            timing_callback("first_forward_backward_optimizer_step_done", model_param_l2=_model_parameter_l2(model))
         total_loss += float(loss.item())
         steps += 1
         if tqdm is not None and not _progress_disabled():
@@ -378,6 +482,77 @@ def _run_dir(config: RunConfig) -> Path:
     root = Path(config.experiment.output_root) / config.experiment.name / _timestamp()
     root.mkdir(parents=True, exist_ok=False)
     return root.resolve()
+
+
+def _checkpoint_run_dir(resume_state: dict[str, Any] | None) -> Path | None:
+    if resume_state is None:
+        return None
+    raw_run_dir = resume_state.get("run_dir")
+    if not raw_run_dir:
+        return None
+    return Path(raw_run_dir).expanduser().resolve()
+
+
+def _assert_resume_compatible(config: RunConfig, resume_state: dict[str, Any], resume_checkpoint: Path) -> None:
+    checkpoint_config = resume_state.get("config", {})
+    checkpoint_experiment = checkpoint_config.get("experiment", {})
+    expected = {
+        "model_name": config.experiment.model_name,
+        "context_size": config.experiment.context_size,
+        "horizon_size": config.experiment.horizon_size,
+        "num_entities": config.experiment.num_entities,
+    }
+    actual = {key: checkpoint_experiment.get(key) for key in expected}
+    if actual != expected:
+        raise ValueError(
+            f"Resume checkpoint {resume_checkpoint} is not compatible with the requested config. Expected {expected}, found {actual}."
+        )
+
+
+def _training_checkpoint_payload(
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler: Any | None,
+    scaler: Any | None,
+    ema: ExponentialMovingAverage | None,
+    swa_model: AveragedModel | None,
+    config: RunConfig,
+    split: dict[str, list[int]],
+    normalizer: Normalizer,
+    epoch: int,
+    best_epoch: int,
+    best_metric: float,
+    patience: int,
+    history: list[dict[str, float]],
+    mixed_precision: bool,
+    run_dir: Path,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "config": config.to_dict(),
+        "split": split,
+        "normalizer": normalizer.state_dict(),
+        "epoch": epoch,
+        "best_epoch": best_epoch,
+        "best_metric": best_metric,
+        "checkpoint_metric": config.experiment.checkpoint_metric,
+        "patience": patience,
+        "history": history,
+        "mixed_precision": mixed_precision,
+        "run_dir": str(run_dir),
+    }
+    if lr_scheduler is not None:
+        payload["lr_scheduler_state"] = lr_scheduler.state_dict()
+    if scaler is not None:
+        payload["scaler_state"] = scaler.state_dict()
+    if ema is not None:
+        payload["ema_model_state"] = ema.model.state_dict()
+        payload["ema_decay"] = ema.decay
+    if swa_model is not None:
+        payload["swa_model_state"] = swa_model.state_dict()
+    return payload
 
 
 def _load_runtime_config(
@@ -429,23 +604,88 @@ def train_experiment(
     config_arg: str | Path,
     overrides: dict[str, object] | None = None,
     epoch_reporter=None,
+    timing_callback=None,
+    resume_checkpoint: str | Path | None = None,
 ) -> Path:
+    if timing_callback is not None:
+        timing_callback("train_experiment_start")
     config, config_path = _load_runtime_config(config_arg, overrides)
+    if timing_callback is not None:
+        timing_callback("train_config_loaded")
     set_seed(config.experiment.seed)
     device = resolve_device(config.experiment.device)
     print("Using device:", device)
-    split, all_paths, normalizer = _prepare_split_and_normalizer(config)
-    train_dataset, val_dataset, train_loader, val_loader = _build_dataloaders(config, split, all_paths, normalizer)
-    model = build_model(config).to(device)
+    mixed_precision = _mixed_precision_enabled(device, config.training.mixed_precision)
+    print("Mixed precision:", "enabled" if mixed_precision else "disabled")
+    resume_state: dict[str, Any] | None = None
+    resume_path: Path | None = None
+    if resume_checkpoint is not None:
+        resume_path = Path(resume_checkpoint).expanduser().resolve()
+        if timing_callback is not None:
+            timing_callback("checkpoint_restore_start", path=str(resume_path))
+        resume_state = torch.load(resume_path, map_location=device, weights_only=False)
+        _assert_resume_compatible(config, resume_state, resume_path)
+    if timing_callback is not None:
+        timing_callback("dataset_loading_start")
+    split, all_sequences, normalizer = _prepare_split_and_normalizer(config)
+    if timing_callback is not None:
+        timing_callback("dataset_loading_done")
+        timing_callback("dataloader_construction_start")
+    train_dataset, val_dataset, train_loader, val_loader = _build_dataloaders(config, split, all_sequences, normalizer)
+    if timing_callback is not None:
+        timing_callback("dataloader_construction_done")
+        timing_callback("model_construction_start")
+    model = build_model(config)
+    if timing_callback is not None:
+        timing_callback("model_construction_done")
+        timing_callback("first_cuda_operation_start")
+    model = model.to(device)
+    model = _apply_optimization_backend(model, config.model.optimization_backend)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    if timing_callback is not None:
+        timing_callback("first_cuda_operation_done")
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.training.lr,
         weight_decay=config.training.weight_decay,
     )
+    lr_scheduler = _build_lr_scheduler(config, optimizer)
     ema = ExponentialMovingAverage(model, config.training.ema_decay) if config.training.ema_decay > 0.0 else None
     swa_model = AveragedModel(model) if config.training.swa_start_pct > 0.0 else None
     swa_start_epoch = max(1, int(config.training.epochs * config.training.swa_start_pct)) if swa_model else 0
-    run_dir = _run_dir(config)
+    scaler = _cuda_grad_scaler(mixed_precision) if mixed_precision else None
+    best_metric = float("inf")
+    best_epoch = 0
+    patience = 0
+    history: list[dict[str, float]] = []
+    start_epoch = 1
+    if resume_state is not None and resume_path is not None:
+        model.load_state_dict(resume_state["model_state"])
+        if "optimizer_state" in resume_state:
+            optimizer.load_state_dict(resume_state["optimizer_state"])
+        if lr_scheduler is not None and "lr_scheduler_state" in resume_state:
+            lr_scheduler.load_state_dict(resume_state["lr_scheduler_state"])
+        if scaler is not None and "scaler_state" in resume_state:
+            scaler.load_state_dict(resume_state["scaler_state"])
+        if ema is not None and "ema_model_state" in resume_state:
+            ema.model.load_state_dict(resume_state["ema_model_state"])
+        if swa_model is not None and "swa_model_state" in resume_state:
+            swa_model.load_state_dict(resume_state["swa_model_state"])
+        best_metric = float(resume_state.get("best_metric", float("inf")))
+        best_epoch = int(resume_state.get("best_epoch", 0))
+        patience = int(resume_state.get("patience", 0))
+        history = list(resume_state.get("history", []))
+        start_epoch = int(resume_state.get("epoch", 0)) + 1
+        if timing_callback is not None:
+            timing_callback("checkpoint_restore_done", path=str(resume_path), start_epoch=start_epoch)
+    initial_param_l2 = _model_parameter_l2(model)
+    if timing_callback is not None:
+        timing_callback("initial_model_state", model_param_l2=initial_param_l2)
+    run_dir = _checkpoint_run_dir(resume_state) or _run_dir(config)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if timing_callback is not None:
+        timing_callback("run_dir_created", run_dir=str(run_dir))
     shutil.copy2(config_path, run_dir / "config_source.toml")
     _write_json(run_dir / "resolved_config.json", config.to_dict())
     _write_json(
@@ -459,13 +699,9 @@ def train_experiment(
         },
     )
 
-    best_metric = float("inf")
-    best_epoch = 0
-    patience = 0
-    history: list[dict[str, float]] = []
     epoch_iterator = _progress_bar(
-        range(1, config.training.epochs + 1),
-        total=config.training.epochs,
+        range(start_epoch, config.training.epochs + 1),
+        total=max(0, config.training.epochs - start_epoch + 1),
         desc=f"epochs:{config.experiment.name}",
         leave=True,
     )
@@ -485,9 +721,13 @@ def train_experiment(
             scheduled_sampling_prob=scheduled_sampling_prob,
             ema=ema,
             max_batches=_optional_batch_limit(config.training.max_train_batches),
+            scaler=scaler,
+            mixed_precision=mixed_precision,
+            timing_callback=timing_callback if epoch == 1 else None,
         )
         if swa_model is not None and epoch >= swa_start_epoch:
             swa_model.update_parameters(model)
+        epoch_param_l2 = _model_parameter_l2(model)
         eval_model, eval_model_kind = _validation_model(
             model=model,
             ema=ema,
@@ -501,6 +741,7 @@ def train_experiment(
             device=device,
             num_examples=0,
             max_batches=_optional_batch_limit(config.training.max_val_batches),
+            mixed_precision=mixed_precision,
         )
         row = {
             "epoch": epoch,
@@ -510,6 +751,9 @@ def train_experiment(
             "val_ade": val_metrics["ade"],
             "val_rmse": val_metrics["rmse"],
             "scheduled_sampling_prob": scheduled_sampling_prob,
+            "lr": optimizer.param_groups[0]["lr"],
+            "model_param_l2": epoch_param_l2,
+            "model_param_l2_delta": epoch_param_l2 - initial_param_l2,
         }
         history.append(row)
         _write_history_csv(run_dir / "history.csv", history)
@@ -525,6 +769,8 @@ def train_experiment(
             best_metric = current_metric
             best_epoch = epoch
             patience = 0
+            if timing_callback is not None:
+                timing_callback("checkpoint_write_start", path=str(run_dir / "best.pt"), epoch=epoch)
             torch.save(
                 {
                     "model_state": eval_model.state_dict(),
@@ -537,6 +783,8 @@ def train_experiment(
                 },
                 run_dir / "best.pt",
             )
+            if timing_callback is not None:
+                timing_callback("checkpoint_write_done", path=str(run_dir / "best.pt"), epoch=epoch)
         else:
             patience += 1
         if epoch_reporter is not None:
@@ -546,6 +794,29 @@ def train_experiment(
             report_payload["checkpoint_metric"] = current_metric
             report_payload["run_dir"] = str(run_dir)
             epoch_reporter(report_payload)
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+        torch.save(
+            _training_checkpoint_payload(
+                model=model,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                scaler=scaler,
+                ema=ema,
+                swa_model=swa_model,
+                config=config,
+                split=split,
+                normalizer=normalizer,
+                epoch=epoch,
+                best_epoch=best_epoch,
+                best_metric=best_metric,
+                patience=patience,
+                history=history,
+                mixed_precision=mixed_precision,
+                run_dir=run_dir,
+            ),
+            run_dir / "last.pt",
+        )
         if patience >= config.training.patience:
             break
 
@@ -558,9 +829,164 @@ def train_experiment(
         "run_dir": str(run_dir),
         "ema_decay": config.training.ema_decay,
         "swa_start_pct": config.training.swa_start_pct,
+        "mixed_precision": mixed_precision,
     }
     _write_json(run_dir / "train_summary.json", summary)
     return run_dir
+
+
+def _benchmark_step(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: Any | None,
+    batch: dict[str, torch.Tensor],
+    device: torch.device,
+    mixed_precision: bool,
+    grad_clip: float,
+) -> dict[str, float]:
+    timings: dict[str, float] = {}
+    _synchronize_device(device)
+    started = time.perf_counter()
+    context = batch["context"].to(device)
+    target = batch["future_xy"].to(device)
+    _synchronize_device(device)
+    timings["transfer_s"] = time.perf_counter() - started
+
+    started = time.perf_counter()
+    with _cuda_autocast(mixed_precision):
+        prediction = model(context, future_xy=target)
+        loss = normalized_mse_loss(prediction, target)
+    _synchronize_device(device)
+    timings["forward_s"] = time.perf_counter() - started
+
+    started = time.perf_counter()
+    optimizer.zero_grad()
+    if scaler is not None and mixed_precision:
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+    _synchronize_device(device)
+    timings["backward_optimizer_s"] = time.perf_counter() - started
+    timings["loss"] = float(loss.item())
+    return timings
+
+
+def _mean(values: list[float]) -> float:
+    return statistics.fmean(values) if values else 0.0
+
+
+def benchmark_experiment(
+    config_arg: str | Path,
+    overrides: dict[str, object] | None = None,
+    warmup_steps: int = 5,
+    steps: int = 20,
+    profile: bool = False,
+    output_dir: str | Path | None = None,
+) -> Path:
+    config, _ = _load_runtime_config(config_arg, overrides)
+    set_seed(config.experiment.seed)
+    device = resolve_device(config.experiment.device)
+    mixed_precision = _mixed_precision_enabled(device, config.training.mixed_precision)
+    split, all_sequences, normalizer = _prepare_split_and_normalizer(config)
+    _, _, train_loader, _ = _build_dataloaders(config, split, all_sequences, normalizer)
+    model = build_model(config).to(device)
+    model = _apply_optimization_backend(model, config.model.optimization_backend)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.lr, weight_decay=config.training.weight_decay)
+    scaler = _cuda_grad_scaler(mixed_precision) if mixed_precision else None
+    bench_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else Path(config.experiment.output_root) / "benchmarks" / config.experiment.name / _timestamp()
+    )
+    bench_dir.mkdir(parents=True, exist_ok=True)
+
+    def next_batch(iterator):
+        try:
+            return next(iterator), iterator
+        except StopIteration:
+            new_iterator = iter(train_loader)
+            return next(new_iterator), new_iterator
+
+    iterator = iter(train_loader)
+    model.train()
+    for _ in range(warmup_steps):
+        batch, iterator = next_batch(iterator)
+        _benchmark_step(model, optimizer, scaler, batch, device, mixed_precision, config.training.grad_clip)
+
+    profiler = None
+    if profile:
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if device.type == "cuda":
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        profiler = torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,
+        )
+
+    rows: list[dict[str, float]] = []
+    data_load_times: list[float] = []
+    with profiler if profiler is not None else nullcontext() as active_profiler:
+        for _ in range(steps):
+            started = time.perf_counter()
+            batch, iterator = next_batch(iterator)
+            data_load_times.append(time.perf_counter() - started)
+            row = _benchmark_step(model, optimizer, scaler, batch, device, mixed_precision, config.training.grad_clip)
+            rows.append(row)
+            if active_profiler is not None:
+                active_profiler.step()
+
+    if profiler is not None:
+        profiler.export_chrome_trace(str(bench_dir / "torch_profiler_trace.json"))
+        (bench_dir / "torch_profiler_key_averages.txt").write_text(
+            profiler.key_averages().table(sort_by="cuda_time_total" if device.type == "cuda" else "cpu_time_total", row_limit=40)
+        )
+
+    total_times = [
+        data_load + row["transfer_s"] + row["forward_s"] + row["backward_optimizer_s"]
+        for data_load, row in zip(data_load_times, rows, strict=True)
+    ]
+    summary = {
+        "config": str(config_arg),
+        "experiment": config.experiment.name,
+        "model": config.experiment.model_name,
+        "device": str(device),
+        "mixed_precision": mixed_precision,
+        "warmup_steps": warmup_steps,
+        "steps": steps,
+        "batch_size": config.training.batch_size,
+        "num_workers": config.training.num_workers,
+        "mean_data_load_s": _mean(data_load_times),
+        "mean_transfer_s": _mean([row["transfer_s"] for row in rows]),
+        "mean_forward_s": _mean([row["forward_s"] for row in rows]),
+        "mean_backward_optimizer_s": _mean([row["backward_optimizer_s"] for row in rows]),
+        "mean_step_s": _mean(total_times),
+        "steps_per_second": 1.0 / _mean(total_times) if total_times else 0.0,
+        "mean_loss": _mean([row["loss"] for row in rows]),
+        "profile_trace": str(bench_dir / "torch_profiler_trace.json") if profile else None,
+    }
+    _write_json(bench_dir / "benchmark_summary.json", summary)
+    _write_rows_csv(
+        bench_dir / "benchmark_steps.csv",
+        [
+            {
+                "step": idx,
+                "data_load_s": data_load,
+                **row,
+                "step_s": data_load + row["transfer_s"] + row["forward_s"] + row["backward_optimizer_s"],
+            }
+            for idx, (data_load, row) in enumerate(zip(data_load_times, rows, strict=True), start=1)
+        ],
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return bench_dir.resolve()
 
 
 def _load_checkpoint(checkpoint_path: str | Path, device: torch.device) -> tuple[dict, RunConfig, Normalizer, torch.nn.Module]:
@@ -582,9 +1008,11 @@ def _dataset_for_split(
     split = checkpoint["split"]
     if split_name not in split:
         raise ValueError(f"Unknown split {split_name!r}. Expected one of {sorted(split)}.")
-    all_paths = collect_sequence_paths(Path(config.experiment.data_dir) / "train")
+    train_dir = Path(config.experiment.data_dir) / "train"
+    all_sequences = load_sequences_from_dir_or_consolidated(train_dir)
+    sequences_dict = {seq_id: all_sequences[seq_id] for seq_id in split[split_name]}
     return SequenceWindowDataset(
-        sequence_paths=[all_paths[seq_id] for seq_id in split[split_name]],
+        sequence_paths=sequences_dict,
         normalizer=normalizer,
         context_size=config.experiment.context_size,
         horizon_size=config.experiment.horizon_size,
@@ -601,6 +1029,8 @@ def evaluate_checkpoint(
     device = resolve_device(device_arg)
     print("Using device:", device)
     checkpoint, config, normalizer, model = _load_checkpoint(checkpoint_path, device)
+    mixed_precision = _mixed_precision_enabled(device, config.training.mixed_precision)
+    print("Mixed precision:", "enabled" if mixed_precision else "disabled")
     dataset = _dataset_for_split(config, checkpoint, normalizer, split_name)
     dataloader = DataLoader(
         dataset,
@@ -614,6 +1044,7 @@ def evaluate_checkpoint(
         normalizer=normalizer,
         device=device,
         num_examples=config.evaluation.num_examples,
+        mixed_precision=mixed_precision,
     )
     base_dir = Path(output_dir) if output_dir else Path(checkpoint_path).resolve().parent / f"eval_{split_name}"
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -645,6 +1076,8 @@ def submit_checkpoint(
     device = resolve_device(device_arg)
     print("Using device:", device)
     _, config, normalizer, model = _load_checkpoint(checkpoint_path, device)
+    mixed_precision = _mixed_precision_enabled(device, config.training.mixed_precision)
+    print("Mixed precision:", "enabled" if mixed_precision else "disabled")
     dataset = TestSequenceDataset(
         test_dir=Path(config.experiment.data_dir) / "test",
         normalizer=normalizer,
@@ -655,7 +1088,8 @@ def submit_checkpoint(
     with torch.no_grad():
         for batch in dataloader:
             context = batch["context"].to(device)
-            prediction = model(context)
+            with _cuda_autocast(mixed_precision):
+                prediction = model(context)
             prediction_raw = _denormalize_predictions(prediction, normalizer).cpu()
             for idx in range(prediction_raw.shape[0]):
                 seq_id = int(batch["sequence_id"][idx].item())

@@ -125,5 +125,6 @@ def build_model(config: RunConfig) -> nn.Module:
             decoder_layers=model_cfg.decoder_layers,
             transformer_ffn_multiplier=model_cfg.transformer_ffn_multiplier,
             graph_ablation_mode=model_cfg.graph_ablation_mode,
+            graph_prep_backend=model_cfg.graph_prep_backend,
         )
     raise ValueError(f"Unknown model name {model_name!r}.")

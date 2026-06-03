@@ -9,21 +9,28 @@
 #SBATCH --time=00:15:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --account=ee-452
+#SBATCH --mail-type=NONE
 #SBATCH --gres=gpu:1
 
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/nml-project}"
-source "$PROJECT_ROOT/cluster/izar_env.sh"
+IZAR_MODULES="${IZAR_MODULES:-gcc/11.3.0 cuda/12.1.1}"
+DEVICE="${DEVICE:-cuda}"
 
 mkdir -p "$PROJECT_ROOT/.mplconfig" logs
 
-load_izar_modules
-activate_izar_env
-configure_izar_threads
-check_izar_python
+module purge
+module load $IZAR_MODULES
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-1}}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-1}}"
+export MPLCONFIGDIR="$PROJECT_ROOT/.mplconfig"
+export PYTHONUNBUFFERED=1
 
 cd "$PROJECT_ROOT"
+source .venv/bin/activate
+
+python -m nba_forecasting doctor --expect-cuda
 
 python -m nba_forecasting train \
   --config e3_dynamic_graph_direct \

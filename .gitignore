@@ -222,8 +222,7 @@ runs/
 logs/
 artifacts/splits/
 artifacts/cv/
-data/*.csv
-data/train/
-data/test/
+data/
 .mplconfig/
 .DS_Store
+local/

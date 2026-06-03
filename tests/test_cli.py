@@ -260,6 +260,170 @@ class CliTests(unittest.TestCase):
             _, kwargs = tune.call_args
             self.assertEqual(kwargs["search_specs"], SEARCH_PROFILES["graph_transformer"])
 
+    def test_benchmark_cli_dispatches_runtime_arguments(self) -> None:
+        with patch("nba_forecasting.cli.benchmark_experiment") as benchmark:
+            benchmark.return_value = Path("/tmp/benchmark")
+            code = main(
+                [
+                    "benchmark",
+                    "--config",
+                    "e5_graph_transformer",
+                    "--device",
+                    "cuda",
+                    "--batch-size",
+                    "128",
+                    "--num-workers",
+                    "4",
+                    "--warmup-steps",
+                    "3",
+                    "--steps",
+                    "7",
+                    "--profile",
+                    "--output-dir",
+                    "/tmp/bench",
+                    "--set",
+                    "training.mixed_precision=true",
+                ]
+            )
+            self.assertEqual(code, 0)
+            benchmark.assert_called_once()
+            args, kwargs = benchmark.call_args
+            self.assertEqual(args[0], "e5_graph_transformer")
+            self.assertEqual(kwargs["warmup_steps"], 3)
+            self.assertEqual(kwargs["steps"], 7)
+            self.assertTrue(kwargs["profile"])
+            self.assertEqual(kwargs["output_dir"], "/tmp/bench")
+            self.assertEqual(kwargs["overrides"]["experiment.device"], "cuda")
+            self.assertEqual(kwargs["overrides"]["training.batch_size"], 128)
+            self.assertEqual(kwargs["overrides"]["training.num_workers"], 4)
+            self.assertEqual(kwargs["overrides"]["training.mixed_precision"], True)
+
+    def test_bench_components_cli_dispatches_runtime_arguments(self) -> None:
+        with patch("nba_forecasting.cli.run_component_benchmarks") as benchmark:
+            benchmark.return_value = Path("/tmp/components")
+            code = main(
+                [
+                    "bench-components",
+                    "--config",
+                    "e5_graph_transformer",
+                    "--component",
+                    "graph_prep",
+                    "--device",
+                    "cpu",
+                    "--batch-size",
+                    "8",
+                    "--warmup",
+                    "3",
+                    "--iterations",
+                    "4",
+                    "--output-dir",
+                    "/tmp/components",
+                    "--set",
+                    "model.graph_prep_backend=fused",
+                ]
+            )
+            self.assertEqual(code, 0)
+            benchmark.assert_called_once()
+            args, kwargs = benchmark.call_args
+            self.assertEqual(args[0], "e5_graph_transformer")
+            self.assertEqual(kwargs["component"], "graph_prep")
+            self.assertEqual(kwargs["warmup"], 3)
+            self.assertEqual(kwargs["iterations"], 4)
+            self.assertEqual(kwargs["device_arg"], "cpu")
+            self.assertEqual(kwargs["batch_size"], 8)
+            self.assertEqual(kwargs["output_dir"], "/tmp/components")
+            self.assertEqual(kwargs["overrides"]["model.graph_prep_backend"], "fused")
+
+    def test_bench_transformer_optimizations_cli_dispatches_matrix_arguments(self) -> None:
+        with patch("nba_forecasting.cli.run_graph_transformer_optimization_suite") as benchmark:
+            benchmark.return_value = Path("/tmp/transformer-bench")
+            code = main(
+                [
+                    "bench-transformer-optimizations",
+                    "--config",
+                    "e5_graph_transformer",
+                    "--variants",
+                    "baseline,compile_fused_graph_prep",
+                    "--device",
+                    "cuda",
+                    "--batch-size",
+                    "192",
+                    "--num-workers",
+                    "4",
+                    "--component-warmup",
+                    "5",
+                    "--component-iterations",
+                    "7",
+                    "--real-warmup-steps",
+                    "3",
+                    "--real-steps",
+                    "11",
+                    "--skip-real-step",
+                    "--fail-fast",
+                    "--output-dir",
+                    "/tmp/transformer-bench",
+                    "--set",
+                    "training.mixed_precision=true",
+                ]
+            )
+            self.assertEqual(code, 0)
+            benchmark.assert_called_once()
+            args, kwargs = benchmark.call_args
+            self.assertEqual(args[0], "e5_graph_transformer")
+            self.assertEqual(kwargs["variants"], ["baseline", "compile_fused_graph_prep"])
+            self.assertEqual(kwargs["device_arg"], "cuda")
+            self.assertEqual(kwargs["batch_size"], 192)
+            self.assertEqual(kwargs["num_workers"], 4)
+            self.assertEqual(kwargs["component_warmup"], 5)
+            self.assertEqual(kwargs["component_iterations"], 7)
+            self.assertEqual(kwargs["real_warmup_steps"], 3)
+            self.assertEqual(kwargs["real_steps"], 11)
+            self.assertFalse(kwargs["include_real_step"])
+            self.assertTrue(kwargs["fail_fast"])
+            self.assertEqual(kwargs["output_dir"], "/tmp/transformer-bench")
+            self.assertEqual(kwargs["overrides"]["training.mixed_precision"], True)
+
+    def test_doctor_cli_dispatches_expect_cuda(self) -> None:
+        with patch("nba_forecasting.cli.run_doctor") as doctor:
+            doctor.return_value = 0
+            code = main(["doctor", "--expect-cuda"])
+            self.assertEqual(code, 0)
+            doctor.assert_called_once_with(expect_cuda=True)
+
+    def test_prepare_data_cli_dispatches_arguments(self) -> None:
+        with patch("nba_forecasting.cli.prepare_remote_dataset") as prepare:
+            prepare.return_value = {
+                "data_dir": "/tmp/data",
+                "train_consolidated": "/tmp/data/train_consolidated.pt",
+                "test_consolidated": "/tmp/data/test_consolidated.pt",
+                "split_path": "/tmp/artifacts/splits/default_split.json",
+                "train_sequences": 8,
+                "val_sequences": 1,
+                "holdout_sequences": 1,
+            }
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = main(
+                    [
+                        "prepare-data",
+                        "--data-dir",
+                        "/tmp/data",
+                        "--split-path",
+                        "/tmp/artifacts/splits/default_split.json",
+                        "--seed",
+                        "7",
+                        "--overwrite",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            prepare.assert_called_once_with(
+                data_dir="/tmp/data",
+                split_path="/tmp/artifacts/splits/default_split.json",
+                seed=7,
+                overwrite=True,
+            )
+            self.assertIn("train_consolidated: /tmp/data/train_consolidated.pt", output.getvalue())
+
     def test_fixed_message_graph_profile_leaves_message_type_to_config(self) -> None:
         specs = SEARCH_PROFILES["graph_fixed_message"]
         self.assertTrue(any(spec.startswith("model.message_dim=") for spec in specs))
@@ -313,6 +477,33 @@ class CliTests(unittest.TestCase):
             self.assertIn('name = "tuned"', exported_text)
             self.assertIn("hidden_dim = 192", exported_text)
             self.assertIn("lr = 0.0005", exported_text)
+
+    def test_summarize_timing_cli_reads_trainable_traces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            trace_dir = root / "123456" / "ray_tune" / "cfg" / "20260101" / "trainable_timing"
+            trace_dir.mkdir(parents=True)
+            trace = trace_dir / "trial_1.jsonl"
+            trace.write_text(
+                "\n".join(
+                    [
+                        '{"event":"trial_start","elapsed_s":0.0}',
+                        '{"event":"runtime_context","elapsed_s":0.1,"hostname":"node","cuda_visible_devices":"0","torch_version":"2.5.1"}',
+                        '{"event":"dataset_loading_start","elapsed_s":1.0}',
+                        '{"event":"dataset_loading_done","elapsed_s":3.5}',
+                        '{"event":"first_tune_report_start","elapsed_s":8.0}',
+                    ]
+                )
+                + "\n"
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = main(["summarize-timing", "--root", str(root), "--format", "markdown"])
+            self.assertEqual(code, 0)
+            text = output.getvalue()
+            self.assertIn("trial_1.jsonl", text)
+            self.assertIn("2.500s", text)
+            self.assertIn("8.000s", text)
 
 
 if __name__ == "__main__":

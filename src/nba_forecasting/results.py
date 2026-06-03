@@ -266,6 +266,147 @@ def format_runtime_estimate_markdown(rows: list[dict[str, Any]], target_samples:
     return "\n".join(table) + "\n"
 
 
+def collect_timing_trace_rows(root: str | Path) -> list[dict[str, Any]]:
+    search_root = Path(root)
+    if not search_root.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for trace_path in sorted(search_root.rglob("trainable_timing/*.jsonl")):
+        events: dict[str, dict[str, Any]] = {}
+        for line in trace_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            event = row.get("event")
+            if isinstance(event, str):
+                events[event] = row
+        rows.append(
+            {
+                "trace": str(trace_path),
+                "job_id": _job_id_from_path(trace_path),
+                "trial_start_s": _event_elapsed(events, "trial_start"),
+                "imports_s": _event_delta(events, "heavy_imports_start", "heavy_imports_done"),
+                "dataset_s": _event_delta(events, "dataset_loading_start", "dataset_loading_done"),
+                "dataloader_s": _event_delta(events, "dataloader_construction_start", "dataloader_construction_done"),
+                "model_s": _event_delta(events, "model_construction_start", "model_construction_done"),
+                "first_cuda_s": _event_delta(events, "first_cuda_operation_start", "first_cuda_operation_done"),
+                "first_batch_at_s": _event_elapsed(events, "first_batch_retrieved"),
+                "first_step_s": _event_delta(events, "first_step_start", "first_forward_backward_optimizer_step_done"),
+                "first_report_at_s": _event_elapsed(events, "first_tune_report_start"),
+                "checkpoint_s": _event_delta(events, "checkpoint_write_start", "checkpoint_write_done"),
+                "final_restore_s": _event_delta(events, "final_checkpoint_restore_start", "final_checkpoint_restore_done"),
+                "ray_checkpoint_s": _event_delta(events, "ray_checkpoint_write_start", "ray_checkpoint_write_done"),
+                "hostname": _event_value(events, "runtime_context", "hostname"),
+                "pid": _event_value(events, "runtime_context", "pid"),
+                "cuda_visible_devices": _event_value(events, "runtime_context", "cuda_visible_devices"),
+                "ray_gpu_ids": _event_value(events, "runtime_context", "ray_gpu_ids"),
+                "omp_num_threads": _event_value(events, "runtime_context", "omp_num_threads"),
+                "mkl_num_threads": _event_value(events, "runtime_context", "mkl_num_threads"),
+                "torch_version": _event_value(events, "runtime_context", "torch_version"),
+                "torch_cuda_version": _event_value(events, "runtime_context", "torch_cuda_version"),
+                "torch_cuda_is_available": _event_value(events, "runtime_context", "torch_cuda_is_available"),
+                "torch_cuda_device_count": _event_value(events, "runtime_context", "torch_cuda_device_count"),
+            }
+        )
+    return rows
+
+
+def _event_elapsed(events: dict[str, dict[str, Any]], event: str) -> float | None:
+    value = events.get(event, {}).get("elapsed_s")
+    return float(value) if isinstance(value, int | float) else None
+
+
+def _event_delta(events: dict[str, dict[str, Any]], start: str, end: str) -> float | None:
+    start_s = _event_elapsed(events, start)
+    end_s = _event_elapsed(events, end)
+    if start_s is None or end_s is None:
+        return None
+    return end_s - start_s
+
+
+def _event_value(events: dict[str, dict[str, Any]], event: str, key: str) -> Any:
+    return events.get(event, {}).get(key, "")
+
+
+TIMING_COLUMNS = [
+    "trace",
+    "job_id",
+    "hostname",
+    "pid",
+    "cuda_visible_devices",
+    "ray_gpu_ids",
+    "omp_num_threads",
+    "mkl_num_threads",
+    "torch_version",
+    "torch_cuda_version",
+    "torch_cuda_is_available",
+    "torch_cuda_device_count",
+    "imports_s",
+    "dataset_s",
+    "dataloader_s",
+    "model_s",
+    "first_cuda_s",
+    "first_batch_at_s",
+    "first_step_s",
+    "first_report_at_s",
+    "checkpoint_s",
+    "final_restore_s",
+    "ray_checkpoint_s",
+]
+
+
+def format_timing_traces_csv(rows: list[dict[str, Any]]) -> str:
+    from io import StringIO
+
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=TIMING_COLUMNS)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({column: "" if row.get(column) is None else row.get(column, "") for column in TIMING_COLUMNS})
+    return output.getvalue()
+
+
+def format_timing_traces_markdown(rows: list[dict[str, Any]]) -> str:
+    columns = [
+        "trace",
+        "gpu",
+        "imports",
+        "dataset",
+        "loader",
+        "model",
+        "cuda",
+        "first batch",
+        "first step",
+        "first report",
+        "checkpoint",
+    ]
+    table = ["| " + " | ".join(columns) + " |", "| " + " | ".join("---" for _ in columns) + " |"]
+    for row in rows:
+        values = [
+            Path(str(row.get("trace", ""))).name,
+            str(row.get("cuda_visible_devices", "")),
+            _format_seconds(row.get("imports_s")),
+            _format_seconds(row.get("dataset_s")),
+            _format_seconds(row.get("dataloader_s")),
+            _format_seconds(row.get("model_s")),
+            _format_seconds(row.get("first_cuda_s")),
+            _format_seconds(row.get("first_batch_at_s")),
+            _format_seconds(row.get("first_step_s")),
+            _format_seconds(row.get("first_report_at_s")),
+            _format_seconds(row.get("checkpoint_s")),
+        ]
+        table.append("| " + " | ".join(value.replace("|", "\\|") for value in values) + " |")
+    if not rows:
+        table.extend(["", "No trainable timing traces found."])
+    return "\n".join(table) + "\n"
+
+
+def _format_seconds(value: Any) -> str:
+    if not isinstance(value, int | float):
+        return ""
+    return f"{float(value):.3f}s"
+
+
 def _toml_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -273,6 +414,8 @@ def _toml_value(value: Any) -> str:
         return repr(value)
     if isinstance(value, str):
         return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
     raise TypeError(f"Cannot write TOML value {value!r}.")
 
 

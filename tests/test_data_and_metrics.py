@@ -9,10 +9,12 @@ import torch
 
 from nba_forecasting.data import (
     SequenceWindowDataset,
+    collect_sequence_ids,
     collect_sequence_paths,
     compute_normalizer,
     freeze_kfold_sequence_splits,
     freeze_sequence_split,
+    prepare_remote_dataset,
 )
 from nba_forecasting.metrics import compute_raw_metrics, normalized_mse_loss
 from tests.helpers import write_synthetic_dataset
@@ -37,6 +39,25 @@ class DataAndMetricsTests(unittest.TestCase):
         self.assertFalse(set(first["train"]).intersection(first["val"]))
         self.assertFalse(set(first["train"]).intersection(first["holdout"]))
         self.assertFalse(set(first["val"]).intersection(first["holdout"]))
+
+    def test_prepare_remote_dataset_consolidates_train_test_and_split(self) -> None:
+        split_path = self.root / "artifacts" / "splits" / "default.json"
+        summary = prepare_remote_dataset(self.data_dir, split_path, seed=7)
+        train_consolidated = self.data_dir / "train_consolidated.pt"
+        test_consolidated = self.data_dir / "test_consolidated.pt"
+        self.assertEqual(summary["train_consolidated"], str(train_consolidated.resolve()))
+        self.assertEqual(summary["test_consolidated"], str(test_consolidated.resolve()))
+        self.assertTrue(train_consolidated.exists())
+        self.assertTrue(test_consolidated.exists())
+        self.assertTrue(split_path.exists())
+
+        train_dir = self.data_dir / "train"
+        for path in train_dir.glob("*.pt"):
+            path.unlink()
+        train_dir.rmdir()
+        self.assertEqual(len(collect_sequence_ids(train_dir)), 10)
+        split = freeze_sequence_split(train_dir, split_path, seed=999)
+        self.assertEqual(len(split["train"]) + len(split["val"]) + len(split["holdout"]), 10)
 
     def test_freeze_kfold_splits_cover_pool_and_preserve_holdout(self) -> None:
         base_split_path = self.root / "artifacts" / "splits" / "default.json"
