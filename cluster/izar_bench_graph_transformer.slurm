@@ -19,7 +19,7 @@ IZAR_MODULES="${IZAR_MODULES:-gcc/11.3.0 cuda/12.1.1}"
 RUN_ROOT="${RUN_ROOT:-/scratch/izar/$USER/nba_forecasting/graph_transformer_bench_$SLURM_JOB_ID}"
 CONFIG="${CONFIG:-e5_graph_transformer}"
 DEVICE="${DEVICE:-cuda}"
-VARIANTS="${VARIANTS:-baseline,compile,compile_fused_graph_prep}"
+VARIANTS="${VARIANTS:-baseline,compile,compile_fused_graph_prep,compile_fused_graph_prep_graph_cache_fused_adamw}"
 BATCH_SIZE="${BATCH_SIZE:-192}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 COMPONENT_WARMUP="${COMPONENT_WARMUP:-100}"
@@ -28,6 +28,7 @@ REAL_WARMUP_STEPS="${REAL_WARMUP_STEPS:-20}"
 REAL_STEPS="${REAL_STEPS:-300}"
 INCLUDE_REAL_STEP="${INCLUDE_REAL_STEP:-1}"
 FAIL_FAST="${FAIL_FAST:-0}"
+MIXED_PRECISION_MODES="${MIXED_PRECISION_MODES:-false,true}"
 
 mkdir -p "$RUN_ROOT" "$PROJECT_ROOT/.mplconfig" logs
 if [[ -z "${TMPDIR:-}" ]]; then
@@ -56,7 +57,7 @@ if [[ "$FAIL_FAST" == "1" ]]; then
   EXTRA_ARGS+=(--fail-fast)
 fi
 
-python -m nba_forecasting bench-transformer-optimizations \
+python -m nba_forecasting bench-model-optimizations \
   --config "$CONFIG" \
   --variants "$VARIANTS" \
   --device "$DEVICE" \
@@ -66,5 +67,6 @@ python -m nba_forecasting bench-transformer-optimizations \
   --component-iterations "$COMPONENT_ITERATIONS" \
   --real-warmup-steps "$REAL_WARMUP_STEPS" \
   --real-steps "$REAL_STEPS" \
+  --mixed-precision-modes "$MIXED_PRECISION_MODES" \
   --output-dir "$RUN_ROOT" \
   "${EXTRA_ARGS[@]}"

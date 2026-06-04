@@ -129,5 +129,6 @@ def build_model(config: RunConfig) -> nn.Module:
             mdn_components=model_cfg.mdn_components,
             mdn_point_estimate=model_cfg.mdn_point_estimate,
             graph_prep_backend=model_cfg.graph_prep_backend,
+            graph_cache_backend=model_cfg.graph_cache_backend,
         )
     raise ValueError(f"Unknown model name {model_name!r}.")

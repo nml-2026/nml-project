@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import traceback
 
 
 def _version(package: str) -> str:
@@ -41,7 +42,26 @@ def _extract_nvcc_cuda_version(output: str | None) -> str | None:
     return match.group(1) if match else None
 
 
-def run_doctor(*, expect_cuda: bool = False) -> int:
+def _check_inductor(device: str) -> tuple[bool, str]:
+    try:
+        import torch
+
+        if device == "cuda" and not torch.cuda.is_available():
+            return False, "CUDA requested for Inductor check, but torch.cuda.is_available() is false."
+        resolved = torch.device(device)
+        module = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)).to(resolved)
+        sample = torch.randn(4, 8, device=resolved)
+        compiled = torch.compile(module, mode="reduce-overhead")
+        compiled(sample).sum().backward()
+        if resolved.type == "cuda":
+            torch.cuda.synchronize(resolved)
+        return True, "ok"
+    except Exception as exc:  # noqa: BLE001 - this is a diagnostics command.
+        detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+        return False, detail
+
+
+def run_doctor(*, expect_cuda: bool = False, check_inductor: bool = False, inductor_device: str = "cuda") -> int:
     print(f"python: {sys.version.split()[0]} ({sys.executable})")
     print(f"platform: {platform.platform()}")
     print(f"numpy: {_version('numpy')}")
@@ -83,4 +103,18 @@ def run_doctor(*, expect_cuda: bool = False) -> int:
     if expect_cuda and not cuda_available:
         print("error: CUDA was expected but torch.cuda.is_available() is false")
         return 1
+    if check_inductor:
+        import torch._dynamo
+
+        from .runner import _configure_torch_dynamo_for_compile
+
+        _configure_torch_dynamo_for_compile()
+        print(f"torch._dynamo.config.cache_size_limit: {torch._dynamo.config.cache_size_limit}")
+        accumulated = getattr(torch._dynamo.config, "accumulated_cache_size_limit", "unavailable")
+        print(f"torch._dynamo.config.accumulated_cache_size_limit: {accumulated}")
+        ok, detail = _check_inductor(inductor_device)
+        print(f"inductor check ({inductor_device}): {'ok' if ok else 'failed'}")
+        if not ok:
+            print(f"inductor error: {detail}")
+            return 1
     return 0

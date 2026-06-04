@@ -7,3 +7,4 @@ model_name = "e5_graph_transformer"
 [model]
 optimization_backend = "compile"
 graph_prep_backend = "fused"
+graph_cache_backend = "reuse"

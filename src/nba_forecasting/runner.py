@@ -221,8 +221,10 @@ def _configure_torch_dynamo_for_compile() -> None:
         torch._dynamo.config.accumulated_cache_size_limit = 256
 
 
-def _apply_optimization_backend(model: torch.nn.Module, backend: str) -> torch.nn.Module:
+def _apply_optimization_backend(model: torch.nn.Module, backend: str, device: torch.device | None = None) -> torch.nn.Module:
     if backend == "none":
+        return model
+    if device is not None and device.type != "cuda":
         return model
     if backend == "compile":
         _configure_torch_dynamo_for_compile()
@@ -236,6 +238,28 @@ def _apply_optimization_backend(model: torch.nn.Module, backend: str) -> torch.n
             "Use optimization_backend='compile' for CUDA Graph based reduce-overhead capture."
         )
     raise ValueError("optimization_backend must be one of: none, compile, compile_default, cudagraph.")
+
+
+def _mark_compiled_cuda_step_begin(model: torch.nn.Module, device: torch.device) -> None:
+    if device.type != "cuda" or not hasattr(model, "_orig_mod"):
+        return
+    mark_step = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
+    if mark_step is not None:
+        mark_step()
+
+
+def build_optimizer(config: RunConfig, model: torch.nn.Module, device: torch.device) -> torch.optim.Optimizer:
+    backend = config.model.optimizer_backend
+    if backend == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=config.training.lr, weight_decay=config.training.weight_decay)
+    if backend == "adamw_fused":
+        if device.type != "cuda":
+            return torch.optim.AdamW(model.parameters(), lr=config.training.lr, weight_decay=config.training.weight_decay)
+        try:
+            return torch.optim.AdamW(model.parameters(), lr=config.training.lr, weight_decay=config.training.weight_decay, fused=True)
+        except TypeError as exc:
+            raise RuntimeError("optimizer_backend='adamw_fused' is not supported by this PyTorch build.") from exc
+    raise ValueError("optimizer_backend must be one of: adamw, adamw_fused.")
 
 
 def _timestamp() -> str:
@@ -462,6 +486,7 @@ def evaluate_model(
             context = batch["context"].to(device)
             target = batch["future_xy"].to(device)
             with _cuda_autocast(mixed_precision):
+                _mark_compiled_cuda_step_begin(model, device)
                 prediction = _tta_predict(model, context, normalizer, tta_group, use_velocity)
                 loss = normalized_mse_loss(prediction, target)
             if not torch.isfinite(prediction).all():
@@ -589,6 +614,7 @@ def _train_one_epoch(
         target = batch["future_xy"].to(device)
 
         with _cuda_autocast(mixed_precision):
+            _mark_compiled_cuda_step_begin(model, device)
             if mdn_point_estimate is not None:
                 params = model.mixture_forward(
                     context,
@@ -714,6 +740,7 @@ def _training_checkpoint_payload(
         "patience": patience,
         "history": history,
         "mixed_precision": mixed_precision,
+        "optimizer_backend": config.model.optimizer_backend,
         "run_dir": str(run_dir),
     }
     if lr_scheduler is not None:
@@ -815,16 +842,12 @@ def train_experiment(
         timing_callback("model_construction_done")
         timing_callback("first_cuda_operation_start")
     model = model.to(device)
-    model = _apply_optimization_backend(model, config.model.optimization_backend)
+    model = _apply_optimization_backend(model, config.model.optimization_backend, device)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     if timing_callback is not None:
         timing_callback("first_cuda_operation_done")
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.training.lr,
-        weight_decay=config.training.weight_decay,
-    )
+    optimizer = build_optimizer(config, model, device)
     lr_scheduler = _build_lr_scheduler(config, optimizer)
     ema = ExponentialMovingAverage(model, config.training.ema_decay) if config.training.ema_decay > 0.0 else None
     swa_model = AveragedModel(model) if config.training.swa_start_pct > 0.0 else None
@@ -1034,6 +1057,7 @@ def train_experiment(
         "lr_scheduler": config.training.lr_scheduler,
         "swa_lr": config.training.swa_lr,
         "mixed_precision": mixed_precision,
+        "optimizer_backend": config.model.optimizer_backend,
     }
     _write_json(run_dir / "train_summary.json", summary)
     return run_dir
@@ -1058,13 +1082,14 @@ def _benchmark_step(
 
     started = time.perf_counter()
     with _cuda_autocast(mixed_precision):
+        _mark_compiled_cuda_step_begin(model, device)
         prediction = model(context, future_xy=target)
         loss = normalized_mse_loss(prediction, target)
     _synchronize_device(device)
     timings["forward_s"] = time.perf_counter() - started
 
     started = time.perf_counter()
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
     if scaler is not None and mixed_precision:
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -1100,8 +1125,8 @@ def benchmark_experiment(
     split, all_sequences, normalizer = _prepare_split_and_normalizer(config)
     _, _, train_loader, _ = _build_dataloaders(config, split, all_sequences, normalizer)
     model = build_model(config).to(device)
-    model = _apply_optimization_backend(model, config.model.optimization_backend)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.lr, weight_decay=config.training.weight_decay)
+    model = _apply_optimization_backend(model, config.model.optimization_backend, device)
+    optimizer = build_optimizer(config, model, device)
     scaler = _cuda_grad_scaler(mixed_precision) if mixed_precision else None
     bench_dir = (
         Path(output_dir)
@@ -1163,6 +1188,7 @@ def benchmark_experiment(
         "model": config.experiment.model_name,
         "device": str(device),
         "mixed_precision": mixed_precision,
+        "optimizer_backend": config.model.optimizer_backend,
         "warmup_steps": warmup_steps,
         "steps": steps,
         "batch_size": config.training.batch_size,

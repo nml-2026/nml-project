@@ -85,8 +85,8 @@ def run_component_benchmarks(*args, **kwargs):
     return impl(*args, **kwargs)
 
 
-def run_graph_transformer_optimization_suite(*args, **kwargs):
-    from .bench import run_graph_transformer_optimization_suite as impl
+def run_model_optimization_suite(*args, **kwargs):
+    from .bench import run_model_optimization_suite as impl
 
     return impl(*args, **kwargs)
 
@@ -336,7 +336,14 @@ def build_parser() -> argparse.ArgumentParser:
     bench_components_parser.add_argument("--config", required=True, help="Config name under configs/ or a direct TOML path.")
     bench_components_parser.add_argument(
         "--component",
-        choices=["graph_prep", "attention", "spatial_block", "temporal_block", "full_step", "all"],
+        choices=[
+            "graph_prep",
+            "attention",
+            "spatial_block",
+            "temporal_block",
+            "full_step",
+            "all",
+        ],
         default="all",
         help="Component to benchmark.",
     )
@@ -345,32 +352,42 @@ def build_parser() -> argparse.ArgumentParser:
     bench_components_parser.add_argument("--output-dir", default=None, help="Optional output directory for benchmark artifacts.")
     _add_runtime_override_args(bench_components_parser)
 
-    bench_transformer_parser = subparsers.add_parser(
-        "bench-transformer-optimizations",
-        help="Benchmark graph Transformer optimization variants and summarize speedups/failures.",
+    bench_model_parser = subparsers.add_parser(
+        "bench-model-optimizations",
+        help="Benchmark optional graph Transformer and runtime optimization variants.",
     )
-    bench_transformer_parser.add_argument("--config", default="e5_graph_transformer", help="Base graph Transformer config.")
-    bench_transformer_parser.add_argument(
+    bench_model_parser.add_argument("--config", required=True, help="Base config.")
+    bench_model_parser.add_argument(
         "--variants",
         default=None,
-        help="Comma-separated variant names. Defaults to the full optimization matrix.",
+        help="Comma-separated variant names. Defaults to the active graph/runtime optimization matrix.",
     )
-    bench_transformer_parser.add_argument("--component-warmup", type=int, default=100, help="Synthetic component warmup iterations.")
-    bench_transformer_parser.add_argument("--component-iterations", type=int, default=500, help="Synthetic component measured iterations.")
-    bench_transformer_parser.add_argument("--real-warmup-steps", type=int, default=20, help="Real dataloader warmup steps.")
-    bench_transformer_parser.add_argument("--real-steps", type=int, default=300, help="Real dataloader measured steps.")
-    bench_transformer_parser.add_argument(
+    bench_model_parser.add_argument("--component-warmup", type=int, default=100, help="Synthetic component warmup iterations.")
+    bench_model_parser.add_argument("--component-iterations", type=int, default=500, help="Synthetic component measured iterations.")
+    bench_model_parser.add_argument("--real-warmup-steps", type=int, default=20, help="Real dataloader warmup steps.")
+    bench_model_parser.add_argument("--real-steps", type=int, default=300, help="Real dataloader measured steps.")
+    bench_model_parser.add_argument(
+        "--mixed-precision-modes",
+        default="false,true",
+        help="Comma-separated precision modes to benchmark: false,true,config. Defaults to false,true.",
+    )
+    bench_model_parser.add_argument(
         "--skip-real-step",
         action="store_true",
         help="Only run synthetic component/full-step benchmarks.",
     )
-    bench_transformer_parser.add_argument(
+    bench_model_parser.add_argument(
         "--fail-fast",
         action="store_true",
         help="Stop the matrix on the first failed variant instead of recording all failures.",
     )
-    bench_transformer_parser.add_argument("--output-dir", default=None, help="Optional output directory for suite artifacts.")
-    _add_runtime_override_args(bench_transformer_parser)
+    bench_model_parser.add_argument(
+        "--capture-compile-logs",
+        action="store_true",
+        help="Capture torch.compile graph-break/recompile diagnostics for compile variants.",
+    )
+    bench_model_parser.add_argument("--output-dir", default=None, help="Optional output directory for suite artifacts.")
+    _add_runtime_override_args(bench_model_parser)
 
     results_parser = subparsers.add_parser("summarize-results", help="Rank Ray Tune and batch results under a run root.")
     results_parser.add_argument(
@@ -410,6 +427,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--expect-cuda",
         action="store_true",
         help="Exit non-zero if PyTorch cannot see CUDA.",
+    )
+    doctor_parser.add_argument(
+        "--check-inductor",
+        action="store_true",
+        help="Run a tiny torch.compile/Inductor execution probe and exit non-zero if it fails.",
+    )
+    doctor_parser.add_argument(
+        "--inductor-device",
+        default="cuda",
+        help="Device used for --check-inductor. Defaults to cuda.",
     )
 
     prepare_data_parser = subparsers.add_parser(
@@ -570,12 +597,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"Component benchmark complete. Outputs written to {benchmark_dir}")
         return 0
-    if args.command == "bench-transformer-optimizations":
+    if args.command == "bench-model-optimizations":
         overrides = _build_overrides(args)
         if args.name_suffix:
             overrides["experiment.name"] = f"{Path(args.config).stem}_{args.name_suffix}"
         variants = [item.strip() for item in args.variants.split(",") if item.strip()] if args.variants else None
-        benchmark_dir = run_graph_transformer_optimization_suite(
+        mixed_precision_modes = [item.strip() for item in args.mixed_precision_modes.split(",") if item.strip()]
+        benchmark_dir = run_model_optimization_suite(
             args.config,
             variants=variants,
             component_warmup=args.component_warmup,
@@ -588,9 +616,11 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output_dir,
             include_real_step=not args.skip_real_step,
             fail_fast=args.fail_fast,
+            capture_compile_logs=args.capture_compile_logs,
+            mixed_precision_modes=mixed_precision_modes,
             overrides=overrides,
         )
-        print(f"Graph Transformer optimization benchmark complete. Outputs written to {benchmark_dir}")
+        print(f"Model optimization benchmark complete. Outputs written to {benchmark_dir}")
         return 0
     if args.command == "summarize-results":
         rows = collect_result_rows(args.root)
@@ -629,7 +659,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Best config written to {output_path}")
         return 0
     if args.command == "doctor":
-        return run_doctor(expect_cuda=args.expect_cuda)
+        return run_doctor(expect_cuda=args.expect_cuda, check_inductor=args.check_inductor, inductor_device=args.inductor_device)
     if args.command == "prepare-data":
         summary = prepare_remote_dataset(
             data_dir=args.data_dir,

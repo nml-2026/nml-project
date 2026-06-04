@@ -136,6 +136,7 @@ class GraphTransformerForecastModel(nn.Module):
         mdn_components: int = 1,
         mdn_point_estimate: str = "mean",
         graph_prep_backend: str = "torch",
+        graph_cache_backend: str = "baseline",
     ) -> None:
         super().__init__()
         if graph_ablation_mode not in {"normal", "no_graph", "shuffled_graph"}:
@@ -146,6 +147,8 @@ class GraphTransformerForecastModel(nn.Module):
             raise ValueError("mdn_point_estimate must be one of: mean, mode.")
         if graph_prep_backend not in {"torch", "fused"}:
             raise ValueError("graph_prep_backend must be one of: torch, fused.")
+        if graph_cache_backend not in {"baseline", "reuse"}:
+            raise ValueError("graph_cache_backend must be one of: baseline, reuse.")
         self.head_type = head_type
         self.mdn_components = mdn_components
         self.mdn_point_estimate = mdn_point_estimate
@@ -159,6 +162,7 @@ class GraphTransformerForecastModel(nn.Module):
         self.edge_radius = edge_radius
         self.graph_ablation_mode = graph_ablation_mode
         self.graph_prep_backend = graph_prep_backend
+        self.graph_cache_backend = graph_cache_backend
         edge_dim = 5 if use_semantic_flags else 3
         node_input_dim = input_dim + (entity_embedding_dim if use_entity_embeddings else 0)
         if use_entity_embeddings:
@@ -262,12 +266,16 @@ class GraphTransformerForecastModel(nn.Module):
         positions: torch.Tensor,
         static: torch.Tensor,
         layer: GraphTransformerSpatialBlock,
+        edge_inputs: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         batch_size, context_size, num_entities, hidden_dim = encoded.shape
         flat_state = encoded.reshape(batch_size * context_size, num_entities, hidden_dim)
-        flat_positions = positions.reshape(batch_size * context_size, num_entities, 2)
-        flat_static = static.unsqueeze(1).expand(-1, context_size, -1, -1).reshape(batch_size * context_size, num_entities, 2)
-        edge_feat, mask = self.graph_inputs(flat_positions, flat_static)
+        if edge_inputs is None:
+            flat_positions = positions.reshape(batch_size * context_size, num_entities, 2)
+            flat_static = static.unsqueeze(1).expand(-1, context_size, -1, -1).reshape(batch_size * context_size, num_entities, 2)
+            edge_feat, mask = self.graph_inputs(flat_positions, flat_static)
+        else:
+            edge_feat, mask = edge_inputs
         flat_state = layer(flat_state, edge_feat, mask)
         return flat_state.reshape(batch_size, context_size, num_entities, hidden_dim)
 
@@ -293,6 +301,10 @@ class GraphTransformerForecastModel(nn.Module):
         time_tokens = self.time_embed(torch.arange(context_size, device=context.device)).view(1, context_size, 1, -1)
         encoded = encoded + time_tokens
         layer_count = max(len(self.spatial_layers), len(self.temporal_layers))
+        encoder_edge_inputs = None
+        if self.graph_cache_backend == "reuse" and self.spatial_layers:
+            flat_positions = context[:, :, :, :2].reshape(batch_size * context_size, num_entities, 2)
+            encoder_edge_inputs = self.graph_inputs(flat_positions, flat_static)
         for layer_idx in range(layer_count):
             if layer_idx < len(self.spatial_layers):
                 encoded = self._apply_spatial_layer(
@@ -300,6 +312,7 @@ class GraphTransformerForecastModel(nn.Module):
                     context[:, :, :, :2],
                     static,
                     self.spatial_layers[layer_idx],
+                    edge_inputs=encoder_edge_inputs,
                 )
             if layer_idx < len(self.temporal_layers):
                 encoded = self._apply_temporal_layer(encoded, self.temporal_layers[layer_idx])
@@ -310,10 +323,23 @@ class GraphTransformerForecastModel(nn.Module):
         flat_decoded = decoded.reshape(batch_size * self.horizon_size, num_entities, -1)
         decoder_positions = context[:, -1, :, :2].unsqueeze(1).expand(-1, self.horizon_size, -1, -1)
         decoder_static = static.unsqueeze(1).expand(-1, self.horizon_size, -1, -1)
-        edge_feat, mask = self.graph_inputs(
-            decoder_positions.reshape(batch_size * self.horizon_size, num_entities, 2),
-            decoder_static.reshape(batch_size * self.horizon_size, num_entities, 2),
-        )
+        if self.graph_cache_backend == "reuse":
+            edge_feat_once, mask_once = self.graph_inputs(context[:, -1, :, :2], static)
+            edge_feat = (
+                edge_feat_once.unsqueeze(1)
+                .expand(-1, self.horizon_size, -1, -1, -1)
+                .reshape(batch_size * self.horizon_size, num_entities, num_entities, -1)
+            )
+            mask = (
+                mask_once.unsqueeze(1)
+                .expand(-1, self.horizon_size, -1, -1)
+                .reshape(batch_size * self.horizon_size, num_entities, num_entities)
+            )
+        else:
+            edge_feat, mask = self.graph_inputs(
+                decoder_positions.reshape(batch_size * self.horizon_size, num_entities, 2),
+                decoder_static.reshape(batch_size * self.horizon_size, num_entities, 2),
+            )
         for layer in self.decoder_layers:
             flat_decoded = layer(flat_decoded, edge_feat, mask)
         return flat_decoded, entity_state, static, context[:, -1, :, :2]

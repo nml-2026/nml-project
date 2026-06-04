@@ -130,6 +130,7 @@ The code supports several knobs that are not all exposed as separate configs:
 - `temporal_ssm_layers`, `social_ssm_layers`, `decoder_ssm_layers`: where SSM capacity matters.
 - `transformer_heads`, `spatial_layers`, `temporal_layers`, `decoder_layers`, `transformer_ffn_multiplier`: graph Transformer capacity.
 - `graph_ablation_mode`: normal, no-graph, or shuffled-graph behavior for graph Transformer ablations.
+- `optimization_backend`, `optimizer_backend`, `training.mixed_precision`: global runtime optimization flags. CUDA runs use `torch.compile`, fused AdamW, and autocast when requested; CPU and MPS runs fall back to eager execution, standard AdamW, and fp32.
 - `teacher_forcing_prob` / `scheduled_sampling_final_prob`: rollout training strategy for autoregressive models.
 
 ## Main Comparisons

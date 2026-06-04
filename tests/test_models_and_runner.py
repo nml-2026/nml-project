@@ -33,6 +33,7 @@ from nba_forecasting.runner import (
     _ensemble_predict_raw,
     _load_checkpoint,
     _tta_predict,
+    build_optimizer,
     cross_validate_experiment,
     evaluate_checkpoint,
     evaluate_ensemble,
@@ -160,6 +161,19 @@ class ModelAndRunnerTests(unittest.TestCase):
             scheduler.step()
 
         self.assertEqual(observed, [0.01, 0.005, 0.005, 0.0025])
+
+    def test_build_optimizer_uses_adamw_backend(self) -> None:
+        config = make_config("e1_joint_gru", use_velocity=True)
+        model = torch.nn.Linear(2, 2)
+        optimizer = build_optimizer(config, model, torch.device("cpu"))
+        self.assertIsInstance(optimizer, torch.optim.AdamW)
+
+    def test_fused_adamw_falls_back_to_adamw_without_cuda(self) -> None:
+        config = make_config("e1_joint_gru", use_velocity=True)
+        config.model.optimizer_backend = "adamw_fused"
+        model = torch.nn.Linear(2, 2)
+        optimizer = build_optimizer(config, model, torch.device("cpu"))
+        self.assertIsInstance(optimizer, torch.optim.AdamW)
 
     def test_public_configs_load_and_build_models(self) -> None:
         config_paths = sorted((Path(__file__).parents[1] / "configs").glob("*.toml"))

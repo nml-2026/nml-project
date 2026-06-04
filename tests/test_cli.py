@@ -508,12 +508,12 @@ class CliTests(unittest.TestCase):
             self.assertEqual(kwargs["output_dir"], "/tmp/components")
             self.assertEqual(kwargs["overrides"]["model.graph_prep_backend"], "fused")
 
-    def test_bench_transformer_optimizations_cli_dispatches_matrix_arguments(self) -> None:
-        with patch("nba_forecasting.cli.run_graph_transformer_optimization_suite") as benchmark:
+    def test_bench_model_optimizations_dispatches_graph_transformer_variants(self) -> None:
+        with patch("nba_forecasting.cli.run_model_optimization_suite") as benchmark:
             benchmark.return_value = Path("/tmp/transformer-bench")
             code = main(
                 [
-                    "bench-transformer-optimizations",
+                    "bench-model-optimizations",
                     "--config",
                     "e5_graph_transformer",
                     "--variants",
@@ -532,8 +532,11 @@ class CliTests(unittest.TestCase):
                     "3",
                     "--real-steps",
                     "11",
+                    "--mixed-precision-modes",
+                    "false,true",
                     "--skip-real-step",
                     "--fail-fast",
+                    "--capture-compile-logs",
                     "--output-dir",
                     "/tmp/transformer-bench",
                     "--set",
@@ -554,15 +557,17 @@ class CliTests(unittest.TestCase):
             self.assertEqual(kwargs["real_steps"], 11)
             self.assertFalse(kwargs["include_real_step"])
             self.assertTrue(kwargs["fail_fast"])
+            self.assertTrue(kwargs["capture_compile_logs"])
             self.assertEqual(kwargs["output_dir"], "/tmp/transformer-bench")
+            self.assertEqual(kwargs["mixed_precision_modes"], ["false", "true"])
             self.assertEqual(kwargs["overrides"]["training.mixed_precision"], True)
 
     def test_doctor_cli_dispatches_expect_cuda(self) -> None:
         with patch("nba_forecasting.cli.run_doctor") as doctor:
             doctor.return_value = 0
-            code = main(["doctor", "--expect-cuda"])
+            code = main(["doctor", "--expect-cuda", "--check-inductor", "--inductor-device", "cuda"])
             self.assertEqual(code, 0)
-            doctor.assert_called_once_with(expect_cuda=True)
+            doctor.assert_called_once_with(expect_cuda=True, check_inductor=True, inductor_device="cuda")
 
     def test_prepare_data_cli_dispatches_arguments(self) -> None:
         with patch("nba_forecasting.cli.prepare_remote_dataset") as prepare:

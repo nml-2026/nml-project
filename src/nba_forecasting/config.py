@@ -93,12 +93,14 @@ class ModelSection:
     decoder_layers: int = 2
     transformer_ffn_multiplier: float = 2.0
     graph_ablation_mode: str = "normal"
-    optimization_backend: str = "none"
+    optimization_backend: str = "compile"
     graph_prep_backend: str = "torch"
+    graph_cache_backend: str = "baseline"
     # Phase 7 (D1) mixture-density head. Defaults reproduce the deterministic delta head.
     head_type: str = "delta"  # delta | mdn
     mdn_components: int = 1  # K trajectory modes when head_type == "mdn"
     mdn_point_estimate: str = "mean"  # mean (pi-weighted) | mode (argmax pi) for the point output
+    optimizer_backend: str = "adamw_fused"
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> ModelSection:

@@ -39,11 +39,13 @@ temporal_layers = 2
 decoder_layers = 2
 transformer_ffn_multiplier = 2.0
 graph_ablation_mode = "normal"
-optimization_backend = "none"
+optimization_backend = "compile"
 graph_prep_backend = "torch"
+graph_cache_backend = "baseline"
 head_type = "delta"          # delta | mdn (Phase 7: Gaussian-mixture trajectory head)
 mdn_components = 1           # K trajectory modes when head_type = "mdn"
 mdn_point_estimate = "mean"  # mean (pi-weighted) | mode (argmax pi) for the deterministic output
+optimizer_backend = "adamw_fused"
 
 [training]
 epochs = 20
