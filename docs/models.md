@@ -94,7 +94,7 @@ What we implemented or chose for the NBA benchmark:
 | Area | What we did |
 | --- | --- |
 | **Pipeline** | `FamilySpec` registration, `mart.toml` / `tune_mart.toml`, shared data loaders, augmentations, trainer, checkpointing, xy TTA evaluation, and Kaggle submission |
-| **Input adapter** | Map NBA tensors `[x, y, (vx, vy), isplayer, team]` into MART's expected layout (inherits `use_velocity=true` from `base.toml`) |
+| **Input adapter** | Map NBA tensors `[x, y, (vx, vy), isplayer, team]` into MART's expected layout |
 | **Decoder variant** | `mart_decoder_variant = "type_conditioned"` — separate ball/player bias on top of the ported multi-mode head |
 | **Inference aggregation** | `mart_point_aggregation = "learned_softmax"` — learned weights over the $K{=}20$ modes at eval/submit time |
 | **Training loss** | `loss.sample_loss_type = "softmin_ade"` with `loss.sample_loss_space = "raw"` (**softmin-raw**): temperature-weighted minADE in denormalized court coordinates, with tuned `softmin_temperature` and `raw_loss_scale_ft` |

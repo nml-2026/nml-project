@@ -53,6 +53,35 @@ The repository is curated for a single reproducible path:
 
 Curated configs, Tune scripts, and final candidates: [docs/experiments.md](docs/experiments.md).
 
+## Reproducibility checklist
+
+Use this compact checklist when reviewing or rerunning the implementation:
+
+```bash
+# 1. Environment
+uv sync --extra cpu --extra dev
+source .venv/bin/activate
+python -m nba_forecasting doctor
+
+# 2. Data preparation and frozen split
+python -m nba_forecasting prepare-data
+
+# 3. Bounded end-to-end demo on real data
+bash scripts/demo.sh
+
+# 4. Full training, evaluation, and Kaggle export examples
+python -m nba_forecasting train --config dynamic_graph_direct --device auto
+python -m nba_forecasting evaluate --checkpoint runs/dynamic_graph_direct/<timestamp>/best.pt --split val --device auto
+python -m nba_forecasting submit --checkpoint runs/dynamic_graph_direct/<timestamp>/best.pt --output submission.csv --device auto
+
+# 5. Development checks
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run pytest
+```
+
+Generated artifacts are written to `artifacts/splits/default_split.json` for the frozen split and to `runs/<experiment>/<timestamp>/` for training outputs such as `config_source.toml`, `resolved_config.json`, `dataset_summary.json`, `history.csv`, `history.png`, `best.pt`, `last.pt`, and `train_summary.json`.
+
 ## Demo smoke test
 
 Quick check that the environment, tests, and CLI pipeline work (requires `data/`):
