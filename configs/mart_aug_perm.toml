@@ -1,0 +1,8 @@
+extends = "mart.toml"
+
+[experiment]
+name = "mart_aug_perm"
+
+[features.reflection]
+x_prob = 0.0
+y_prob = 0.0

@@ -1,0 +1,11 @@
+extends = "mart.toml"
+
+[experiment]
+name = "mart_aug_none"
+
+[features.reflection]
+x_prob = 0.0
+y_prob = 0.0
+
+[features.augmentation]
+agent_permutation_prob = 0.0

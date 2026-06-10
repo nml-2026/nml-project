@@ -15,28 +15,20 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/nml-project}"
-IZAR_MODULES="${IZAR_MODULES:-gcc/11.3.0 cuda/12.1.1}"
-CONFIG="${CONFIG:-e3_dynamic_graph_direct}"
-DEVICE="${DEVICE:-cuda}"
+CONFIG="${CONFIG:-dynamic_graph_direct}"
 SEARCH_ROOT="${SEARCH_ROOT:-/scratch/izar/$USER/nba_forecasting}"
 SUMMARY="${SUMMARY:-}"
 CHECKPOINT="${CHECKPOINT:-}"
 SUBMISSION_ID="${SLURM_JOB_ID:-manual}"
 OUTPUT="${OUTPUT:-$PROJECT_ROOT/runs/submissions/${CONFIG}_${SUBMISSION_ID}_submission.csv}"
 
-mkdir -p "$PROJECT_ROOT/.mplconfig" logs "$(dirname "$OUTPUT")"
-
-module purge
-module load $IZAR_MODULES
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-1}}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-1}}"
-export MPLCONFIGDIR="$PROJECT_ROOT/.mplconfig"
-export PYTHONUNBUFFERED=1
-
-cd "$PROJECT_ROOT"
-source .venv/bin/activate
-
-python -m nba_forecasting doctor --expect-cuda
+source "$PROJECT_ROOT/cluster/izar_env.sh"
+prepare_izar_dirs
+mkdir -p "$(dirname "$OUTPUT")"
+load_izar_modules
+activate_izar_env
+configure_izar_runtime
+check_izar_python
 
 if [[ -z "$CHECKPOINT" ]]; then
   if [[ -z "$SUMMARY" ]]; then

@@ -1,8 +1,0 @@
-extends = "e3_dynamic_graph.toml"
-
-[experiment]
-name = "e4_no_semantic_flags"
-model_name = "e3_dynamic_graph"
-
-[model]
-use_semantic_flags = false

@@ -1,6 +1,5 @@
 [experiment]
 name = "base"
-model_name = "e1_joint_gru"
 seed = 0
 data_dir = "data"
 output_root = "runs"
@@ -11,66 +10,70 @@ horizon_size = 12
 num_entities = 11
 checkpoint_metric = "ade"
 
+[runtime]
+optimizer_backend = "adamw_fused"
+optimization_backend = "compile"
+mixed_precision = true
+
 [features]
 use_velocity = true
 
-[model]
-hidden_dim = 128
-message_dim = 128
-num_layers = 2
-dropout = 0.1
-k_neighbors = 3
-use_semantic_flags = true
-dynamic_edges = true
-message_passing_type = "mpnn"
-separate_ball_head = false
-use_relation_types = false
-use_entity_embeddings = false
-entity_embedding_dim = 16
-decoder_type = "autoregressive"
-direct_decoder_heads = 4
-temporal_ssm_layers = 2
-social_ssm_layers = 1
-decoder_ssm_layers = 2
-ssm_conv_kernel = 3
-transformer_heads = 4
-spatial_layers = 2
-temporal_layers = 2
-decoder_layers = 2
-transformer_ffn_multiplier = 2.0
-graph_ablation_mode = "normal"
-optimization_backend = "compile"
-graph_prep_backend = "torch"
-graph_cache_backend = "baseline"
-head_type = "delta"          # delta | mdn (Phase 7: Gaussian-mixture trajectory head)
-mdn_components = 1           # K trajectory modes when head_type = "mdn"
-mdn_point_estimate = "mean"  # mean (pi-weighted) | mode (argmax pi) for the deterministic output
-optimizer_backend = "adamw_fused"
+[features.reflection]
+mode = "random"
+y_prob = 0.5
+x_prob = 0.5
+
+[features.augmentation]
+# Shuffles player indices (ball fixed) during training.
+agent_permutation_prob = 0.5
+context_noise_std_ft = 0.0
+context_frame_dropout_prob = 0.0
+context_frame_dropout_mode = "previous"
 
 [training]
 epochs = 20
 batch_size = 128
 lr = 0.001
 weight_decay = 0.0001
-lr_scheduler = "none"      # none | multistep | cosine | cosine_warmup
+lr_scheduler = "none"
 lr_milestones = []
 lr_gamma = 0.1
 grad_clip = 1.0
-num_workers = 0
+# -1 = auto from CPU budget (see runtime_env.py); 0 = disable workers (tests)
+num_workers = -1
 patience = 5
 log_every = 50
 teacher_forcing_prob = 0.0
 scheduled_sampling_final_prob = 0.0
 ema_decay = 0.0
 swa_start_pct = 0.0
-lr_warmup_epochs = 0      # linear-warmup length used by cosine_warmup
-lr_min = 0.0              # cosine floor (eta_min)
-# swa_lr is unset by default (constant-LR SWA); set it in a config to enable SWALR.
+lr_warmup_epochs = 0
+lr_min = 0.0
 max_train_batches = 0
 max_val_batches = 0
 train_window_sampling = "all_windows"
 val_window_sampling = "all_windows"
-mixed_precision = true
+
+[loss]
+lambda_smooth = 0.0
+lambda_boundary = 0.0
+lambda_ball = 0.0
+court_x_half = 47.0
+court_y_half = 25.0
+boundary_margin = 2.0
+ball_max_dist = 8.0
+sample_loss_type = "hard_min_ade"
+sample_loss_space = "normalized"
+raw_loss_scale_ft = 0.0
+softmin_temperature = 1.0
+point_loss_weight = 0.0
+point_loss_start_epoch = 1
+point_loss_warmup_epochs = 0
+mixture_nll_weight = 0.0
+mixture_nll_start_epoch = 1
+mixture_nll_warmup_epochs = 0
+mixture_nll_detach_means = false
 
 [evaluation]
 num_examples = 3
+tta_group = "none"

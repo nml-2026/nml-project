@@ -1,106 +1,32 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from .config import parse_override_value
-from .ray_tune import SEARCH_PROFILES, resolve_search_specs
+from .data import prepare_remote_dataset
+from .doctor import run_doctor
+from .model_comparison import register_arguments as register_model_comparison_arguments
+from .model_comparison import run_from_args as run_model_comparison
+from .ray_tune import SEARCH_PROFILES, resolve_search_specs, run_ray_tune_search
 from .results import (
     collect_result_rows,
-    collect_runtime_rows,
-    collect_timing_trace_rows,
     default_cluster_results_root,
     export_best_config,
     format_results_csv,
     format_results_markdown,
-    format_runtime_estimate_markdown,
-    format_timing_traces_csv,
-    format_timing_traces_markdown,
 )
-
-
-def train_experiment(*args, **kwargs):
-    from .runner import train_experiment as impl
-
-    return impl(*args, **kwargs)
-
-
-def train_many_experiments(*args, **kwargs):
-    from .runner import train_many_experiments as impl
-
-    return impl(*args, **kwargs)
-
-
-def repeat_trials_experiment(*args, **kwargs):
-    from .runner import repeat_trials_experiment as impl
-
-    return impl(*args, **kwargs)
-
-
-def cross_validate_experiment(*args, **kwargs):
-    from .runner import cross_validate_experiment as impl
-
-    return impl(*args, **kwargs)
-
-
-def run_ray_tune_search(*args, **kwargs):
-    from .ray_tune import run_ray_tune_search as impl
-
-    return impl(*args, **kwargs)
-
-
-def evaluate_checkpoint(*args, **kwargs):
-    from .runner import evaluate_checkpoint as impl
-
-    return impl(*args, **kwargs)
-
-
-def submit_checkpoint(*args, **kwargs):
-    from .runner import submit_checkpoint as impl
-
-    return impl(*args, **kwargs)
-
-
-def evaluate_ensemble(*args, **kwargs):
-    from .runner import evaluate_ensemble as impl
-
-    return impl(*args, **kwargs)
-
-
-def submit_ensemble(*args, **kwargs):
-    from .runner import submit_ensemble as impl
-
-    return impl(*args, **kwargs)
-
-
-def benchmark_experiment(*args, **kwargs):
-    from .runner import benchmark_experiment as impl
-
-    return impl(*args, **kwargs)
-
-
-def run_component_benchmarks(*args, **kwargs):
-    from .bench import run_component_benchmarks as impl
-
-    return impl(*args, **kwargs)
-
-
-def run_model_optimization_suite(*args, **kwargs):
-    from .bench import run_model_optimization_suite as impl
-
-    return impl(*args, **kwargs)
-
-
-def run_doctor(*args, **kwargs):
-    from .doctor import run_doctor as impl
-
-    return impl(*args, **kwargs)
-
-
-def prepare_remote_dataset(*args, **kwargs):
-    from .data import prepare_remote_dataset as impl
-
-    return impl(*args, **kwargs)
+from .runner import (
+    cross_validate_experiment,
+    evaluate_checkpoint,
+    evaluate_ensemble,
+    repeat_trials_experiment,
+    submit_checkpoint,
+    submit_ensemble,
+    train_experiment,
+    train_many_experiments,
+)
 
 
 def _add_runtime_override_args(parser: argparse.ArgumentParser) -> None:
@@ -108,7 +34,12 @@ def _add_runtime_override_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed", type=int, default=None, help="Override experiment.seed.")
     parser.add_argument("--epochs", type=int, default=None, help="Override training.epochs.")
     parser.add_argument("--batch-size", type=int, default=None, help="Override training.batch_size.")
-    parser.add_argument("--num-workers", type=int, default=None, help="Override training.num_workers.")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Override training.num_workers (-1=auto, 0=disable, N=explicit).",
+    )
     parser.add_argument("--output-root", default=None, help="Override experiment.output_root.")
     parser.add_argument("--name-suffix", default=None, help="Append a suffix to experiment.name.")
     parser.add_argument(
@@ -116,7 +47,7 @@ def _add_runtime_override_args(parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         metavar="PATH=VALUE",
-        help="Apply an extra dotted-path override such as model.hidden_dim=256.",
+        help="Apply an extra dotted-path override such as model.common.hidden_dim=256.",
     )
 
 
@@ -146,27 +77,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="NBA trajectory forecasting CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    train_parser = subparsers.add_parser("train", help="Train one experiment from a config.")
-    train_parser.add_argument("--config", required=True, help="Config name under configs/ or a direct TOML path.")
-    train_parser.add_argument("--resume-checkpoint", default=None, help="Resume training from a last.pt checkpoint.")
-    _add_runtime_override_args(train_parser)
-
-    train_many_parser = subparsers.add_parser("train-many", help="Train multiple configs sequentially.")
-    train_many_parser.add_argument("--configs", nargs="+", required=True, help="One or more config names or TOML paths.")
-    train_many_parser.add_argument("--seeds", nargs="*", type=int, default=None, help="Optional seed list.")
-    train_many_parser.add_argument(
+    train_parser = subparsers.add_parser("train", help="Train one or more configs sequentially.")
+    train_parser.add_argument(
+        "--config",
+        nargs="+",
+        required=True,
+        help="One or more config names under configs/ or direct TOML paths.",
+    )
+    train_parser.add_argument("--resume-checkpoint", default=None, help="Resume training from a last.pt checkpoint (single-config only).")
+    train_parser.add_argument("--seeds", nargs="*", type=int, default=None, help="Optional seed list for batch training.")
+    train_parser.add_argument(
         "--evaluate-splits",
         nargs="*",
         choices=["train", "val", "holdout"],
         default=None,
         help="Optionally evaluate each completed run on these splits.",
     )
-    train_many_parser.add_argument(
+    train_parser.add_argument(
         "--fail-fast",
         action="store_true",
         help="Stop the batch immediately if one run fails.",
     )
-    _add_runtime_override_args(train_many_parser)
+    _add_runtime_override_args(train_parser)
 
     repeat_parser = subparsers.add_parser("repeat-trials", help="Train the same config multiple times and aggregate metrics.")
     repeat_parser.add_argument("--config", required=True, help="Config name under configs/ or a direct TOML path.")
@@ -215,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="PATH=EXPR",
-        help="Ray Tune search expression such as model.hidden_dim=choice(128,192,256) or training.lr=loguniform(1e-4,5e-3).",
+        help="Ray Tune search expression such as model.common.hidden_dim=choice(128,192,256) or training.lr=loguniform(1e-4,5e-3).",
     )
     tune_parser.add_argument(
         "--search-profile",
@@ -224,7 +156,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Named Ray Tune search profile. Explicit --search specs are appended and can override profile paths.",
     )
     tune_parser.add_argument("--num-samples", type=int, default=8, help="Number of Ray Tune samples to draw.")
-    tune_parser.add_argument("--search-alg", choices=["optuna"], default="optuna", help="Search algorithm to use with Ray Tune.")
+    tune_parser.add_argument(
+        "--search-alg",
+        choices=["optuna", "none"],
+        default="optuna",
+        help="Search algorithm to use with Ray Tune. Use none for exact grid search.",
+    )
     tune_parser.add_argument("--scheduler", choices=["asha", "none"], default="asha", help="Early stopping scheduler.")
     tune_parser.add_argument("--grace-period", type=int, default=1, help="ASHA grace period in epochs.")
     tune_parser.add_argument("--reduction-factor", type=int, default=2, help="ASHA reduction factor.")
@@ -252,6 +189,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Maximum number of concurrently running Ray Tune trials. Keep this at 1 for local MPS runs.",
     )
+    tune_parser.add_argument(
+        "--prune-metric-threshold",
+        type=float,
+        default=None,
+        help="Terminate a Tune trial as a bad sample when the checkpoint metric exceeds this value after --prune-min-epoch.",
+    )
+    tune_parser.add_argument(
+        "--prune-min-epoch",
+        type=int,
+        default=1,
+        help="First epoch where --prune-metric-threshold is allowed to terminate a trial.",
+    )
     _add_runtime_override_args(tune_parser)
 
     eval_parser = subparsers.add_parser("evaluate", help="Evaluate a saved checkpoint on a split.")
@@ -262,8 +211,8 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument(
         "--tta",
         choices=["none", "y", "x", "xy"],
-        default="none",
-        help="Test-time dihedral reflection averaging group (default none = single forward).",
+        default=None,
+        help="Test-time reflection averaging group. Defaults to checkpoint evaluation.tta_group.",
     )
     eval_parser.add_argument(
         "--data-dir",
@@ -278,8 +227,8 @@ def build_parser() -> argparse.ArgumentParser:
     submit_parser.add_argument(
         "--tta",
         choices=["none", "y", "x", "xy"],
-        default="none",
-        help="Test-time dihedral reflection averaging group (default none = single forward).",
+        default=None,
+        help="Test-time reflection averaging group. Defaults to checkpoint evaluation.tta_group.",
     )
     submit_parser.add_argument(
         "--data-dir",
@@ -324,71 +273,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the dataset directory baked into the checkpoints (all legs share the frozen split).",
     )
 
-    benchmark_parser = subparsers.add_parser("benchmark", help="Benchmark training-step performance for one config.")
-    benchmark_parser.add_argument("--config", required=True, help="Config name under configs/ or a direct TOML path.")
-    benchmark_parser.add_argument("--warmup-steps", type=int, default=5, help="Warmup training steps excluded from timings.")
-    benchmark_parser.add_argument("--steps", type=int, default=20, help="Measured training steps.")
-    benchmark_parser.add_argument("--profile", action="store_true", help="Write a PyTorch profiler Chrome trace and operator table.")
-    benchmark_parser.add_argument("--output-dir", default=None, help="Optional output directory for benchmark artifacts.")
-    _add_runtime_override_args(benchmark_parser)
-
-    bench_components_parser = subparsers.add_parser("bench-components", help="Benchmark graph-transformer components.")
-    bench_components_parser.add_argument("--config", required=True, help="Config name under configs/ or a direct TOML path.")
-    bench_components_parser.add_argument(
-        "--component",
-        choices=[
-            "graph_prep",
-            "attention",
-            "spatial_block",
-            "temporal_block",
-            "full_step",
-            "all",
-        ],
-        default="all",
-        help="Component to benchmark.",
-    )
-    bench_components_parser.add_argument("--warmup", type=int, default=50, help="Warmup iterations excluded from timings.")
-    bench_components_parser.add_argument("--iterations", type=int, default=200, help="Measured iterations.")
-    bench_components_parser.add_argument("--output-dir", default=None, help="Optional output directory for benchmark artifacts.")
-    _add_runtime_override_args(bench_components_parser)
-
-    bench_model_parser = subparsers.add_parser(
-        "bench-model-optimizations",
-        help="Benchmark optional graph Transformer and runtime optimization variants.",
-    )
-    bench_model_parser.add_argument("--config", required=True, help="Base config.")
-    bench_model_parser.add_argument(
-        "--variants",
-        default=None,
-        help="Comma-separated variant names. Defaults to the active graph/runtime optimization matrix.",
-    )
-    bench_model_parser.add_argument("--component-warmup", type=int, default=100, help="Synthetic component warmup iterations.")
-    bench_model_parser.add_argument("--component-iterations", type=int, default=500, help="Synthetic component measured iterations.")
-    bench_model_parser.add_argument("--real-warmup-steps", type=int, default=20, help="Real dataloader warmup steps.")
-    bench_model_parser.add_argument("--real-steps", type=int, default=300, help="Real dataloader measured steps.")
-    bench_model_parser.add_argument(
-        "--mixed-precision-modes",
-        default="false,true",
-        help="Comma-separated precision modes to benchmark: false,true,config. Defaults to false,true.",
-    )
-    bench_model_parser.add_argument(
-        "--skip-real-step",
-        action="store_true",
-        help="Only run synthetic component/full-step benchmarks.",
-    )
-    bench_model_parser.add_argument(
-        "--fail-fast",
-        action="store_true",
-        help="Stop the matrix on the first failed variant instead of recording all failures.",
-    )
-    bench_model_parser.add_argument(
-        "--capture-compile-logs",
-        action="store_true",
-        help="Capture torch.compile graph-break/recompile diagnostics for compile variants.",
-    )
-    bench_model_parser.add_argument("--output-dir", default=None, help="Optional output directory for suite artifacts.")
-    _add_runtime_override_args(bench_model_parser)
-
     results_parser = subparsers.add_parser("summarize-results", help="Rank Ray Tune and batch results under a run root.")
     results_parser.add_argument(
         "--root",
@@ -398,25 +282,6 @@ def build_parser() -> argparse.ArgumentParser:
     results_parser.add_argument("--format", choices=["csv", "markdown"], default="csv", help="Output table format.")
     results_parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of rows.")
     results_parser.add_argument("--output", default=None, help="Optional output file path. Defaults to stdout.")
-
-    runtime_parser = subparsers.add_parser("estimate-runtime", help="Estimate full Ray Tune runtime from completed summary files.")
-    runtime_parser.add_argument(
-        "--root",
-        default=None,
-        help=f"Run root to scan. Defaults to {default_cluster_results_root()}.",
-    )
-    runtime_parser.add_argument("--target-samples", type=int, required=True, help="Target Ray Tune samples per config.")
-    runtime_parser.add_argument("--target-epochs", type=int, required=True, help="Target training epochs per trial.")
-    runtime_parser.add_argument("--output", default=None, help="Optional Markdown output path. Defaults to stdout.")
-
-    timing_parser = subparsers.add_parser("summarize-timing", help="Summarize Ray Tune trainable timing JSONL traces.")
-    timing_parser.add_argument(
-        "--root",
-        default=None,
-        help=f"Run root to scan. Defaults to {default_cluster_results_root()}.",
-    )
-    timing_parser.add_argument("--format", choices=["csv", "markdown"], default="markdown", help="Output table format.")
-    timing_parser.add_argument("--output", default=None, help="Optional output file path. Defaults to stdout.")
 
     export_parser = subparsers.add_parser("export-best-config", help="Export the best Ray Tune trial config as reusable TOML.")
     export_parser.add_argument("--summary", required=True, help="Path to ray_tune_summary.json.")
@@ -456,6 +321,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Regenerate consolidated train/test files even if they already exist.",
     )
 
+    model_comparison_parser = subparsers.add_parser(
+        "model-comparison",
+        help="Train and evaluate report-table model-comparison jobs.",
+    )
+    register_model_comparison_arguments(model_comparison_parser)
+
     return parser
 
 
@@ -464,23 +335,26 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "train":
         overrides = _build_overrides(args)
+        configs = args.config
+        batch_mode = len(configs) > 1 or args.seeds or args.evaluate_splits or args.fail_fast
+        if batch_mode:
+            if args.resume_checkpoint is not None:
+                raise ValueError("--resume-checkpoint is only supported for single-config training.")
+            if args.name_suffix:
+                overrides["experiment.name_suffix"] = args.name_suffix
+            batch_dir = train_many_experiments(
+                configs=configs,
+                seeds=args.seeds,
+                overrides=overrides,
+                evaluate_splits=args.evaluate_splits,
+                fail_fast=args.fail_fast,
+            )
+            print(f"Batch training complete. Outputs written to {batch_dir}")
+            return 0
         if args.name_suffix:
-            overrides["experiment.name"] = f"{Path(args.config).stem}_{args.name_suffix}"
-        run_dir = train_experiment(args.config, overrides=overrides, resume_checkpoint=args.resume_checkpoint)
+            overrides["experiment.name"] = f"{Path(configs[0]).stem}_{args.name_suffix}"
+        run_dir = train_experiment(configs[0], overrides=overrides, resume_checkpoint=args.resume_checkpoint)
         print(f"Training complete. Outputs written to {run_dir}")
-        return 0
-    if args.command == "train-many":
-        overrides = _build_overrides(args)
-        if args.name_suffix:
-            overrides["experiment.name_suffix"] = args.name_suffix
-        batch_dir = train_many_experiments(
-            configs=args.configs,
-            seeds=args.seeds,
-            overrides=overrides,
-            evaluate_splits=args.evaluate_splits,
-            fail_fast=args.fail_fast,
-        )
-        print(f"Batch training complete. Outputs written to {batch_dir}")
         return 0
     if args.command == "repeat-trials":
         overrides = _build_overrides(args)
@@ -532,6 +406,8 @@ def main(argv: list[str] | None = None) -> int:
             ray_temp_dir=args.ray_temp_dir,
             tune_storage_path=args.tune_storage_path,
             trace_trainable=args.trace_trainable,
+            prune_metric_threshold=args.prune_metric_threshold,
+            prune_min_epoch=args.prune_min_epoch,
         )
         print(f"Ray Tune search complete. Outputs written to {tune_dir}")
         return 0
@@ -567,61 +443,6 @@ def main(argv: list[str] | None = None) -> int:
         submission_path = submit_ensemble(args.checkpoints, args.output, device_arg=args.device, tta_group=args.tta, data_dir=args.data_dir)
         print(f"Ensemble submission written to {submission_path}")
         return 0
-    if args.command == "benchmark":
-        overrides = _build_overrides(args)
-        if args.name_suffix:
-            overrides["experiment.name"] = f"{Path(args.config).stem}_{args.name_suffix}"
-        benchmark_dir = benchmark_experiment(
-            args.config,
-            overrides=overrides,
-            warmup_steps=args.warmup_steps,
-            steps=args.steps,
-            profile=args.profile,
-            output_dir=args.output_dir,
-        )
-        print(f"Benchmark complete. Outputs written to {benchmark_dir}")
-        return 0
-    if args.command == "bench-components":
-        overrides = _build_overrides(args)
-        if args.name_suffix:
-            overrides["experiment.name"] = f"{Path(args.config).stem}_{args.name_suffix}"
-        benchmark_dir = run_component_benchmarks(
-            args.config,
-            component=args.component,
-            warmup=args.warmup,
-            iterations=args.iterations,
-            device_arg=args.device,
-            batch_size=args.batch_size,
-            output_dir=args.output_dir,
-            overrides=overrides,
-        )
-        print(f"Component benchmark complete. Outputs written to {benchmark_dir}")
-        return 0
-    if args.command == "bench-model-optimizations":
-        overrides = _build_overrides(args)
-        if args.name_suffix:
-            overrides["experiment.name"] = f"{Path(args.config).stem}_{args.name_suffix}"
-        variants = [item.strip() for item in args.variants.split(",") if item.strip()] if args.variants else None
-        mixed_precision_modes = [item.strip() for item in args.mixed_precision_modes.split(",") if item.strip()]
-        benchmark_dir = run_model_optimization_suite(
-            args.config,
-            variants=variants,
-            component_warmup=args.component_warmup,
-            component_iterations=args.component_iterations,
-            real_warmup_steps=args.real_warmup_steps,
-            real_steps=args.real_steps,
-            device_arg=args.device,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            output_dir=args.output_dir,
-            include_real_step=not args.skip_real_step,
-            fail_fast=args.fail_fast,
-            capture_compile_logs=args.capture_compile_logs,
-            mixed_precision_modes=mixed_precision_modes,
-            overrides=overrides,
-        )
-        print(f"Model optimization benchmark complete. Outputs written to {benchmark_dir}")
-        return 0
     if args.command == "summarize-results":
         rows = collect_result_rows(args.root)
         if args.limit is not None:
@@ -631,26 +452,6 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.output).parent.mkdir(parents=True, exist_ok=True)
             Path(args.output).write_text(output)
             print(f"Result summary written to {args.output}")
-        else:
-            print(output, end="")
-        return 0
-    if args.command == "estimate-runtime":
-        rows = collect_runtime_rows(args.root or default_cluster_results_root())
-        output = format_runtime_estimate_markdown(rows, args.target_samples, args.target_epochs)
-        if args.output:
-            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-            Path(args.output).write_text(output)
-            print(f"Runtime estimate written to {args.output}")
-        else:
-            print(output, end="")
-        return 0
-    if args.command == "summarize-timing":
-        rows = collect_timing_trace_rows(args.root or default_cluster_results_root())
-        output = format_timing_traces_csv(rows) if args.format == "csv" else format_timing_traces_markdown(rows)
-        if args.output:
-            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-            Path(args.output).write_text(output)
-            print(f"Timing summary written to {args.output}")
         else:
             print(output, end="")
         return 0
@@ -670,5 +471,11 @@ def main(argv: list[str] | None = None) -> int:
         for key, value in summary.items():
             print(f"{key}: {value}")
         return 0
+    if args.command == "model-comparison":
+        try:
+            return run_model_comparison(args)
+        except (RuntimeError, FileNotFoundError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
     parser.error(f"Unknown command {args.command!r}")
     return 2

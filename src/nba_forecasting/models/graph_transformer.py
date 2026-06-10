@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 from torch import nn
 
-from .common import MixtureDeltaHead, MixtureParams, TypeConditionedDeltaHead, _static_features, reduce_mixture
-from .graph_layers import _edge_features, _full_graph_mask, _knn_graph_mask, _radius_graph_mask, _semantic_graph_mask
-from .graph_prep_fused import graph_inputs_fused
+from .common import (
+    MixtureDeltaHead,
+    MixtureForecast,
+    MixtureParams,
+    TypeConditionedDeltaHead,
+    _edge_features,
+    _full_graph_mask,
+    _knn_graph_mask,
+    _semantic_graph_mask,
+    _static_features,
+    reduce_mixture,
+)
 
 
 class GraphMultiheadAttention(nn.Module):
@@ -110,6 +120,43 @@ class TemporalTransformerBlock(nn.Module):
         return self.norm2(sequence + ffn_out)
 
 
+class VirtualNodeRouter(nn.Module):
+    """Learned global nodes that exchange context with all real entities."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+        ffn_multiplier: float,
+        num_virtual_nodes: int,
+    ) -> None:
+        super().__init__()
+        if num_virtual_nodes < 1:
+            raise ValueError("num_virtual_nodes must be >= 1.")
+        self.num_virtual_nodes = num_virtual_nodes
+        ffn_dim = int(hidden_dim * ffn_multiplier)
+        self.virtual_nodes = nn.Parameter(torch.randn(num_virtual_nodes, hidden_dim) * (hidden_dim**-0.5))
+        self.attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, hidden_dim),
+        )
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+    def forward(self, node_state: torch.Tensor) -> torch.Tensor:
+        batch_size = node_state.shape[0]
+        virtual = self.virtual_nodes.unsqueeze(0).expand(batch_size, -1, -1)
+        augmented = torch.cat([virtual, node_state], dim=1)
+        attended, _ = self.attention(augmented, augmented, augmented, need_weights=False)
+        augmented = self.norm1(augmented + attended)
+        augmented = self.norm2(augmented + self.ffn(augmented))
+        return augmented[:, self.num_virtual_nodes :]
+
+
 class GraphTransformerForecastModel(nn.Module):
     def __init__(
         self,
@@ -125,44 +172,40 @@ class GraphTransformerForecastModel(nn.Module):
         separate_ball_head: bool,
         use_entity_embeddings: bool,
         entity_embedding_dim: int,
-        edge_radius: float | None,
         transformer_heads: int,
         spatial_layers: int,
         temporal_layers: int,
         decoder_layers: int,
         transformer_ffn_multiplier: float,
         graph_ablation_mode: str,
+        num_virtual_nodes: int = 0,
         head_type: str = "delta",
         mdn_components: int = 1,
         mdn_point_estimate: str = "mean",
-        graph_prep_backend: str = "torch",
-        graph_cache_backend: str = "baseline",
+        oracle_student_head: bool = False,
     ) -> None:
         super().__init__()
         if graph_ablation_mode not in {"normal", "no_graph", "shuffled_graph"}:
             raise ValueError("graph_ablation_mode must be one of: normal, no_graph, shuffled_graph.")
         if head_type not in {"delta", "mdn"}:
             raise ValueError("head_type must be one of: delta, mdn.")
-        if mdn_point_estimate not in {"mean", "mode"}:
-            raise ValueError("mdn_point_estimate must be one of: mean, mode.")
-        if graph_prep_backend not in {"torch", "fused"}:
-            raise ValueError("graph_prep_backend must be one of: torch, fused.")
-        if graph_cache_backend not in {"baseline", "reuse"}:
-            raise ValueError("graph_cache_backend must be one of: baseline, reuse.")
+        if mdn_point_estimate not in {"mean", "mode", "medoid", "student"}:
+            raise ValueError("mdn_point_estimate must be one of: mean, mode, medoid, student.")
+        if mdn_point_estimate == "student" and not oracle_student_head:
+            raise ValueError("mdn_point_estimate='student' requires model.head.oracle_student_head=true.")
+        if num_virtual_nodes < 0:
+            raise ValueError("model.graph_transformer.num_virtual_nodes must be >= 0.")
         self.head_type = head_type
         self.mdn_components = mdn_components
         self.mdn_point_estimate = mdn_point_estimate
+        self.num_virtual_nodes = num_virtual_nodes
         self.num_entities = num_entities
-        self.context_size = context_size
         self.horizon_size = horizon_size
         self.k_neighbors = k_neighbors
         self.use_semantic_flags = use_semantic_flags
         self.dynamic_edges = dynamic_edges
         self.use_entity_embeddings = use_entity_embeddings
-        self.edge_radius = edge_radius
         self.graph_ablation_mode = graph_ablation_mode
-        self.graph_prep_backend = graph_prep_backend
-        self.graph_cache_backend = graph_cache_backend
         edge_dim = 5 if use_semantic_flags else 3
         node_input_dim = input_dim + (entity_embedding_dim if use_entity_embeddings else 0)
         if use_entity_embeddings:
@@ -204,10 +247,17 @@ class GraphTransformerForecastModel(nn.Module):
             for _ in range(decoder_layers)
         )
         self.decoder_input = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.virtual_router = (
+            VirtualNodeRouter(hidden_dim, transformer_heads, dropout, transformer_ffn_multiplier, num_virtual_nodes)
+            if num_virtual_nodes > 0
+            else None
+        )
         if head_type == "mdn":
             self.delta_head = MixtureDeltaHead(hidden_dim, dropout, mdn_components)
+            self.oracle_student_head = TypeConditionedDeltaHead(hidden_dim, dropout, separate_ball_head) if oracle_student_head else None
         else:
             self.delta_head = TypeConditionedDeltaHead(hidden_dim, dropout, separate_ball_head)
+            self.oracle_student_head = None
 
     def _entity_embedding(self, static: torch.Tensor) -> torch.Tensor:
         if not self.use_entity_embeddings:
@@ -234,8 +284,6 @@ class GraphTransformerForecastModel(nn.Module):
             mask = _knn_graph_mask(positions, self.k_neighbors)
             if self.use_semantic_flags:
                 mask = mask | _semantic_graph_mask(static)
-        if self.edge_radius is not None:
-            mask = mask & _radius_graph_mask(positions, self.edge_radius)
         if self.graph_ablation_mode == "shuffled_graph":
             permutation = torch.arange(positions.shape[1], device=positions.device).roll(1)
             mask = mask.index_select(2, permutation)
@@ -244,16 +292,6 @@ class GraphTransformerForecastModel(nn.Module):
         return mask
 
     def graph_inputs(self, positions: torch.Tensor, static: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.graph_prep_backend == "fused":
-            return graph_inputs_fused(
-                positions,
-                static,
-                k_neighbors=self.k_neighbors,
-                use_semantic_flags=self.use_semantic_flags,
-                dynamic_edges=self.dynamic_edges,
-                edge_radius=self.edge_radius,
-                ablation_mode=self.graph_ablation_mode,
-            )
         mask = self._base_graph_mask(positions, static)
         edge_feat = _edge_features(positions, static, self.use_semantic_flags)
         if self.graph_ablation_mode == "no_graph":
@@ -277,6 +315,8 @@ class GraphTransformerForecastModel(nn.Module):
         else:
             edge_feat, mask = edge_inputs
         flat_state = layer(flat_state, edge_feat, mask)
+        if self.virtual_router is not None:
+            flat_state = self.virtual_router(flat_state)
         return flat_state.reshape(batch_size, context_size, num_entities, hidden_dim)
 
     def _apply_temporal_layer(self, encoded: torch.Tensor, layer: TemporalTransformerBlock) -> torch.Tensor:
@@ -302,46 +342,40 @@ class GraphTransformerForecastModel(nn.Module):
         encoded = encoded + time_tokens
         layer_count = max(len(self.spatial_layers), len(self.temporal_layers))
         encoder_edge_inputs = None
-        if self.graph_cache_backend == "reuse" and self.spatial_layers:
+        if self.spatial_layers:
             flat_positions = context[:, :, :, :2].reshape(batch_size * context_size, num_entities, 2)
             encoder_edge_inputs = self.graph_inputs(flat_positions, flat_static)
         for layer_idx in range(layer_count):
             if layer_idx < len(self.spatial_layers):
+                spatial_layer: Any = self.spatial_layers[layer_idx]
                 encoded = self._apply_spatial_layer(
                     encoded,
                     context[:, :, :, :2],
                     static,
-                    self.spatial_layers[layer_idx],
+                    spatial_layer,
                     edge_inputs=encoder_edge_inputs,
                 )
             if layer_idx < len(self.temporal_layers):
-                encoded = self._apply_temporal_layer(encoded, self.temporal_layers[layer_idx])
+                temporal_layer: Any = self.temporal_layers[layer_idx]
+                encoded = self._apply_temporal_layer(encoded, temporal_layer)
         entity_state = encoded[:, -1]
         horizon_tokens = self.horizon_embed(torch.arange(self.horizon_size, device=context.device)).view(1, self.horizon_size, 1, -1)
         entity_tokens = entity_state.unsqueeze(1).expand(-1, self.horizon_size, -1, -1)
         decoded = self.decoder_input(torch.cat([entity_tokens, horizon_tokens.expand(batch_size, -1, num_entities, -1)], dim=-1))
         flat_decoded = decoded.reshape(batch_size * self.horizon_size, num_entities, -1)
-        decoder_positions = context[:, -1, :, :2].unsqueeze(1).expand(-1, self.horizon_size, -1, -1)
-        decoder_static = static.unsqueeze(1).expand(-1, self.horizon_size, -1, -1)
-        if self.graph_cache_backend == "reuse":
-            edge_feat_once, mask_once = self.graph_inputs(context[:, -1, :, :2], static)
-            edge_feat = (
-                edge_feat_once.unsqueeze(1)
-                .expand(-1, self.horizon_size, -1, -1, -1)
-                .reshape(batch_size * self.horizon_size, num_entities, num_entities, -1)
-            )
-            mask = (
-                mask_once.unsqueeze(1)
-                .expand(-1, self.horizon_size, -1, -1)
-                .reshape(batch_size * self.horizon_size, num_entities, num_entities)
-            )
-        else:
-            edge_feat, mask = self.graph_inputs(
-                decoder_positions.reshape(batch_size * self.horizon_size, num_entities, 2),
-                decoder_static.reshape(batch_size * self.horizon_size, num_entities, 2),
-            )
+        edge_feat_once, mask_once = self.graph_inputs(context[:, -1, :, :2], static)
+        edge_feat = (
+            edge_feat_once.unsqueeze(1)
+            .expand(-1, self.horizon_size, -1, -1, -1)
+            .reshape(batch_size * self.horizon_size, num_entities, num_entities, -1)
+        )
+        mask = (
+            mask_once.unsqueeze(1).expand(-1, self.horizon_size, -1, -1).reshape(batch_size * self.horizon_size, num_entities, num_entities)
+        )
         for layer in self.decoder_layers:
             flat_decoded = layer(flat_decoded, edge_feat, mask)
+            if self.virtual_router is not None:
+                flat_decoded = self.virtual_router(flat_decoded)
         return flat_decoded, entity_state, static, context[:, -1, :, :2]
 
     def _mixture_params(
@@ -362,14 +396,32 @@ class GraphTransformerForecastModel(nn.Module):
         future_xy: torch.Tensor | None = None,
         teacher_forcing_prob: float = 0.0,
         scheduled_sampling_prob: float = 0.0,
-    ) -> MixtureParams:
+    ) -> MixtureParams | MixtureForecast:
         """Full Gaussian-mixture parameters (MDN head only). Used by the NLL training loss
         and the minADE_K evaluation pass; the deterministic pipeline uses ``forward``."""
         del future_xy, teacher_forcing_prob, scheduled_sampling_prob
         if self.head_type != "mdn":
             raise RuntimeError("mixture_forward is only available when head_type == 'mdn'.")
-        flat_decoded, entity_state, _, last_pos = self._encode_decode(context)
-        return self._mixture_params(flat_decoded, entity_state, last_pos)
+        flat_decoded, entity_state, static, last_pos = self._encode_decode(context)
+        params = self._mixture_params(flat_decoded, entity_state, last_pos)
+        if self.oracle_student_head is None:
+            return params
+        student = self._oracle_student_prediction(flat_decoded, static, last_pos)
+        return MixtureForecast(params=params, student=student)
+
+    def _oracle_student_prediction(
+        self,
+        flat_decoded: torch.Tensor,
+        static: torch.Tensor,
+        last_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.oracle_student_head is None:
+            raise RuntimeError("Oracle student head is disabled.")
+        batch_size, num_entities, _ = static.shape
+        decoder_static = static.unsqueeze(1).expand(-1, self.horizon_size, -1, -1)
+        repeated_static = decoder_static.reshape(batch_size * self.horizon_size, num_entities, 2)
+        deltas = self.oracle_student_head(flat_decoded, repeated_static).reshape(batch_size, self.horizon_size, num_entities, 2)
+        return last_pos.unsqueeze(1) + torch.cumsum(deltas, dim=1)
 
     def forward(
         self,
@@ -383,8 +435,48 @@ class GraphTransformerForecastModel(nn.Module):
         flat_decoded, entity_state, static, last_pos = self._encode_decode(context)
         if self.head_type == "mdn":
             params = self._mixture_params(flat_decoded, entity_state, last_pos)
+            if self.mdn_point_estimate == "student":
+                return self._oracle_student_prediction(flat_decoded, static, last_pos)
             return reduce_mixture(params.means, params.log_pi, self.mdn_point_estimate)
         decoder_static = static.unsqueeze(1).expand(-1, self.horizon_size, -1, -1)
         repeated_static = decoder_static.reshape(batch_size * self.horizon_size, num_entities, 2)
         deltas = self.delta_head(flat_decoded, repeated_static).reshape(batch_size, self.horizon_size, num_entities, 2)
         return last_pos.unsqueeze(1) + torch.cumsum(deltas, dim=1)
+
+
+from ..config import GraphTransformerModelConfig, RunConfig  # noqa: E402
+
+
+def build_graph_transformer(config: RunConfig) -> GraphTransformerForecastModel:
+    if not isinstance(config.model, GraphTransformerModelConfig):
+        raise TypeError("graph_transformer requires GraphTransformerModelConfig.")
+    experiment = config.experiment
+    common = config.model.common
+    graph = config.model.graph
+    transformer = config.model.graph_transformer
+    head = config.model.head
+    return GraphTransformerForecastModel(
+        input_dim=config.input_dim,
+        num_entities=experiment.num_entities,
+        context_size=experiment.context_size,
+        horizon_size=experiment.horizon_size,
+        hidden_dim=common.hidden_dim,
+        dropout=common.dropout,
+        k_neighbors=graph.k_neighbors,
+        use_semantic_flags=graph.use_semantic_flags,
+        dynamic_edges=graph.dynamic_edges,
+        separate_ball_head=graph.separate_ball_head,
+        use_entity_embeddings=graph.use_entity_embeddings,
+        entity_embedding_dim=graph.entity_embedding_dim,
+        transformer_heads=transformer.transformer_heads,
+        spatial_layers=transformer.spatial_layers,
+        temporal_layers=transformer.temporal_layers,
+        decoder_layers=transformer.decoder_layers,
+        transformer_ffn_multiplier=transformer.transformer_ffn_multiplier,
+        graph_ablation_mode=transformer.graph_ablation_mode,
+        num_virtual_nodes=transformer.num_virtual_nodes,
+        head_type=head.head_type,
+        mdn_components=head.mdn_components,
+        mdn_point_estimate=head.mdn_point_estimate,
+        oracle_student_head=head.oracle_student_head,
+    )

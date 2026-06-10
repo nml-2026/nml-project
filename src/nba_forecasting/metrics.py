@@ -9,14 +9,52 @@ def normalized_mse_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch
     return torch.mean((prediction - target) ** 2)
 
 
+def min_ade_loss(modes: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Reference-style minADE_K loss over trajectory samples.
+
+    Args:
+        modes: sampled trajectories, shape ``[B, T, N, K, 2]``.
+        target: target trajectory, shape ``[B, T, N, 2]``.
+    Returns:
+        scalar mean over (batch, entity) of the best sample's average L2 error.
+    """
+    distance = torch.linalg.vector_norm(modes - target.unsqueeze(3), dim=-1)
+    ade_per_mode = distance.mean(dim=1)
+    return ade_per_mode.min(dim=-1).values.mean()
+
+
+def ade_per_mode(modes: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Average L2 displacement per mode, shape ``[B, N, K]``."""
+    distance = torch.linalg.vector_norm(modes - target.unsqueeze(3), dim=-1)
+    return distance.mean(dim=1)
+
+
+def softmin_ade_loss(modes: torch.Tensor, target: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Temperature-weighted minADE_K surrogate over trajectory samples."""
+    if temperature <= 0.0:
+        raise ValueError(f"softmin temperature must be > 0, got {temperature}.")
+    per_mode = ade_per_mode(modes, target)
+    weights = torch.softmax(-per_mode.detach() / temperature, dim=-1)
+    return (weights * per_mode).sum(dim=-1).mean()
+
+
+def best_mode_indices(modes: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Oracle best mode per ``(batch, entity)``, shape ``[B, N]``."""
+    return ade_per_mode(modes, target).argmin(dim=-1)
+
+
 def per_example_mse(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return torch.mean((prediction - target) ** 2, dim=(1, 2, 3))
 
 
 def compute_raw_metrics(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+    """Aggregate point-forecast error in denormalized court coordinates.
+
+    ``ade`` is mean squared error over batch, horizon, entities, and $(x,y)$ dimensions.
+    """
     diff = prediction - target
     mse = torch.mean(diff**2).item()
-    ade = torch.mean(torch.sum(diff**2, dim=-1)).item()
+    ade = mse
     rmse = mse**0.5
     distance = torch.linalg.vector_norm(diff, dim=-1)
     ade_l2 = torch.mean(distance).item()

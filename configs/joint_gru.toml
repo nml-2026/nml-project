@@ -1,0 +1,23 @@
+extends = "base.toml"
+
+[experiment]
+name = "joint_gru"
+
+[model]
+family = "joint_gru"
+
+[model.common]
+hidden_dim = 256
+dropout = 0.1
+num_layers = 2
+
+[features]
+use_velocity = false
+
+[training]
+epochs = 80
+batch_size = 128
+patience = 80
+
+[evaluation]
+tta_group = "none"

@@ -1,0 +1,28 @@
+extends = "base.toml"
+
+[experiment]
+name = "baseline"
+
+[model]
+family = "baseline"
+
+[model.common]
+hidden_dim = 32
+dropout = 0.0
+num_layers = 1
+
+[features]
+use_velocity = false
+
+[training]
+epochs = 80
+batch_size = 64
+lr = 0.001
+weight_decay = 0.0005
+grad_clip = 10.0
+patience = 80
+train_window_sampling = "random_window_per_sequence"
+val_window_sampling = "random_window_per_sequence"
+
+[evaluation]
+tta_group = "none"

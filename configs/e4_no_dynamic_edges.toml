@@ -1,8 +1,0 @@
-extends = "e3_dynamic_graph.toml"
-
-[experiment]
-name = "e4_no_dynamic_edges"
-model_name = "e3_dynamic_graph"
-
-[model]
-dynamic_edges = false

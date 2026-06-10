@@ -1,12 +1,26 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 import pandas as pd
 import torch
 
 TEAM_VALUES = torch.tensor([0, -1, -1, -1, -1, -1, 1, 1, 1, 1, 1], dtype=torch.float32)
 IS_PLAYER = (TEAM_VALUES != 0).float()
+
+PUBLICATION_SCRIPTS = frozenset(
+    {
+        "run_tune.sh",
+        "collect_results.py",
+        "demo_smoke.sh",
+    }
+)
+
+
+@runtime_checkable
+class HasGraphInputs(Protocol):
+    def graph_inputs(self, positions: torch.Tensor, static: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def make_synthetic_sequence(length: int, offset: float = 0.0) -> torch.Tensor:
@@ -42,3 +56,14 @@ def write_synthetic_dataset(root: Path, train_lengths: list[int], test_count: in
         index=False,
     )
     return data_dir
+
+
+class SimpleDataset(torch.utils.data.Dataset):
+    def __init__(self, data: list) -> None:
+        self.data = data
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, index: int):
+        return self.data[index]

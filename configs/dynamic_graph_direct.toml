@@ -1,0 +1,31 @@
+extends = "base.toml"
+
+[experiment]
+name = "dynamic_graph_direct"
+
+[model]
+family = "dynamic_graph_direct"
+
+[model.common]
+message_dim = 192
+hidden_dim = 192
+dropout = 0.1
+num_layers = 3
+
+[model.graph]
+dynamic_edges = true
+use_semantic_flags = true
+use_relation_types = true
+k_neighbors = 5
+direct_decoder_heads = 4
+entity_embedding_dim = 16
+decoder_type = "direct"
+separate_ball_head = true
+use_entity_embeddings = true
+
+[training]
+epochs = 80
+batch_size = 192
+lr = 0.0005
+weight_decay = 0.0001
+patience = 20

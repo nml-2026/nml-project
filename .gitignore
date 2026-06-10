@@ -217,12 +217,20 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# LaTeX build artifacts (keep source .tex/.bib and committed PDFs)
+report/*.aux
+report/*.log
+report/*.out
+report/*.blg
+report/*.bbl
+report/*.synctex.gz
+
 # Project outputs and local datasets
 runs/
 logs/
 artifacts/splits/
 artifacts/cv/
-data/
+/data/
 .mplconfig/
 .DS_Store
 local/

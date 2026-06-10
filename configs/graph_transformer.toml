@@ -1,0 +1,41 @@
+extends = "base.toml"
+
+[experiment]
+name = "graph_transformer"
+
+[model]
+family = "graph_transformer"
+
+[model.common]
+hidden_dim = 256
+dropout = 0.0758
+
+[model.graph]
+dynamic_edges = true
+use_semantic_flags = true
+k_neighbors = 3
+entity_embedding_dim = 16
+separate_ball_head = true
+use_entity_embeddings = true
+
+[model.graph_transformer]
+transformer_heads = 4
+spatial_layers = 3
+temporal_layers = 3
+decoder_layers = 1
+transformer_ffn_multiplier = 2.0
+graph_ablation_mode = "normal"
+
+[model.head]
+head_type = "delta"
+mdn_point_estimate = "mean"
+mdn_components = 1
+
+[training]
+batch_size = 64
+lr = 0.000349
+lr_scheduler = "cosine_warmup"
+lr_warmup_epochs = 5
+epochs = 80
+patience = 20
+ema_decay = 0.999

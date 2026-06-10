@@ -1,0 +1,56 @@
+extends = "base.toml"
+
+[experiment]
+name = "mart"
+
+[model]
+family = "mart_hypergraph"
+
+[model.common]
+message_dim = 128
+hidden_dim = 64
+dropout = 0.0
+num_layers = 4
+
+[model.graph_transformer]
+transformer_heads = 8
+spatial_layers = 2
+temporal_layers = 2
+decoder_layers = 2
+transformer_ffn_multiplier = 2.0
+graph_ablation_mode = "normal"
+
+[model.mart]
+mart_function_type = 2
+mart_hyper_scale = 2
+mart_decoder_hidden_dim = 128
+mart_sample_k = 20
+mart_point_aggregation = "learned_softmax"
+mart_decoder_variant = "type_conditioned"
+mart_mode_distribution = "none"
+mart_mixture_min_log_sigma = -7.0
+mart_mixture_max_log_sigma = 5.0
+mart_distribution_detach_features = false
+
+[loss]
+sample_loss_type = "softmin_ade"
+sample_loss_space = "raw"
+raw_loss_scale_ft = 6.234232814778814
+softmin_temperature = 1.0497148893308947
+
+[training]
+epochs = 100
+batch_size = 64
+lr = 0.0006116854570828479
+weight_decay = 0.0
+lr_scheduler = "multistep"
+lr_milestones = [100, 200]
+lr_gamma = 0.5
+lr_warmup_epochs = 3
+lr_min = 1.593202994900522e-05
+grad_clip = 1.0
+patience = 100
+
+[evaluation]
+num_examples = 1
+tta_group = "none"

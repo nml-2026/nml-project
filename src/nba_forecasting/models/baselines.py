@@ -3,10 +3,10 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .common import _next_autoregressive_inputs, _static_features
+from ..config import RunConfig
 
 
-class NotebookExactGRUCell(nn.Module):
+class BaselineGRUCell(nn.Module):
     def __init__(self, input_dim: int, state_dim: int) -> None:
         super().__init__()
         self.state_dim = state_dim
@@ -33,7 +33,7 @@ class NotebookExactGRUCell(nn.Module):
         return update * hidden_prev + (1.0 - update) * candidate
 
 
-class NotebookExactModel(nn.Module):
+class BaselineModel(nn.Module):
     def __init__(
         self,
         input_dim: int,
@@ -44,7 +44,7 @@ class NotebookExactModel(nn.Module):
         super().__init__()
         self.context_size = context_size
         self.horizon_size = horizon_size
-        self.rnn = NotebookExactGRUCell(input_dim, hidden_dim)
+        self.rnn = BaselineGRUCell(input_dim, hidden_dim)
         self.proj = nn.Sequential(
             nn.Linear(hidden_dim, 64, bias=True),
             nn.ReLU(),
@@ -77,53 +77,6 @@ class NotebookExactModel(nn.Module):
                 current = self.proj(hidden_prev)
                 predictions.append(current.reshape(batch_size, num_entities, 2))
         return torch.stack(predictions, dim=1)
-
-
-class ReferenceGRUModel(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, horizon_size: int) -> None:
-        super().__init__()
-        self.horizon_size = horizon_size
-        self.hidden_dim = hidden_dim
-        self.input_dim = input_dim
-        self.cell = nn.GRUCell(input_dim, hidden_dim)
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 2),
-        )
-
-    def forward(
-        self,
-        context: torch.Tensor,
-        future_xy: torch.Tensor | None = None,
-        teacher_forcing_prob: float = 0.0,
-        scheduled_sampling_prob: float = 0.0,
-    ) -> torch.Tensor:
-        del future_xy, teacher_forcing_prob, scheduled_sampling_prob
-        batch_size, context_size, num_entities, feature_dim = context.shape
-        static = _static_features(context).reshape(batch_size * num_entities, 2)
-        hidden = torch.zeros(batch_size * num_entities, self.hidden_dim, device=context.device)
-        previous_xy: torch.Tensor | None = None
-        previous_previous_xy: torch.Tensor | None = None
-        outputs = []
-        for step in range(context_size + self.horizon_size - 1):
-            if step < context_size:
-                current_input = context[:, step].reshape(batch_size * num_entities, feature_dim)
-            else:
-                if previous_xy is None:
-                    raise RuntimeError("Autoregressive rollout requires a previous prediction.")
-                parts = [previous_xy]
-                if feature_dim == 6:
-                    velocity = torch.zeros_like(previous_xy) if previous_previous_xy is None else previous_xy - previous_previous_xy
-                    parts.append(velocity)
-                parts.append(static)
-                current_input = torch.cat(parts, dim=-1)
-            hidden = self.cell(current_input, hidden)
-            if step >= context_size - 1:
-                previous_previous_xy = previous_xy
-                previous_xy = self.head(hidden)
-                outputs.append(previous_xy.reshape(batch_size, num_entities, 2))
-        return torch.stack(outputs, dim=1)
 
 
 class JointGRUForecastModel(nn.Module):
@@ -171,74 +124,24 @@ class JointGRUForecastModel(nn.Module):
         return decoded.reshape(batch_size, self.horizon_size, self.num_entities, 2)
 
 
-class JointAutoregressiveGRUModel(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        num_entities: int,
-        horizon_size: int,
-        hidden_dim: int,
-        num_layers: int,
-        dropout: float,
-        use_velocity: bool,
-    ) -> None:
-        super().__init__()
-        self.num_entities = num_entities
-        self.horizon_size = horizon_size
-        self.use_velocity = use_velocity
-        self.encoder = nn.GRU(
-            input_size=num_entities * input_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-        self.decoder = nn.GRUCell(num_entities * input_dim, hidden_dim)
-        self.head = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_entities * 2),
-        )
+def build_baseline_model(config: RunConfig) -> BaselineModel:
+    common = config.model.common
+    return BaselineModel(
+        input_dim=config.input_dim,
+        hidden_dim=common.hidden_dim,
+        horizon_size=config.experiment.horizon_size,
+        context_size=config.experiment.context_size,
+    )
 
-    def forward(
-        self,
-        context: torch.Tensor,
-        future_xy: torch.Tensor | None = None,
-        teacher_forcing_prob: float = 0.0,
-        scheduled_sampling_prob: float = 0.0,
-    ) -> torch.Tensor:
-        batch_size = context.shape[0]
-        static = _static_features(context)
-        joint_context = context.reshape(batch_size, context.shape[1], -1)
-        _, hidden = self.encoder(joint_context)
-        hidden_state = hidden[-1]
-        current_positions = context[:, -1, :, :2]
-        current_velocity = context[:, -1, :, 2:4] if self.use_velocity else None
-        outputs = []
-        for step in range(self.horizon_size):
-            parts = [current_positions]
-            if self.use_velocity:
-                if current_velocity is None:
-                    current_velocity = torch.zeros_like(current_positions)
-                parts.append(current_velocity)
-            parts.append(static)
-            decoder_input = torch.cat(parts, dim=-1).reshape(batch_size, -1)
-            hidden_state = self.decoder(decoder_input, hidden_state)
-            delta = self.head(hidden_state).reshape(batch_size, self.num_entities, 2)
-            predicted_positions = current_positions + delta
-            outputs.append(predicted_positions)
-            if self.training and future_xy is not None:
-                current_positions, current_velocity = _next_autoregressive_inputs(
-                    current_positions=current_positions,
-                    predicted_positions=predicted_positions,
-                    target_positions=future_xy[:, step],
-                    use_velocity=self.use_velocity,
-                    teacher_forcing_prob=teacher_forcing_prob,
-                    scheduled_sampling_prob=scheduled_sampling_prob,
-                )
-            else:
-                current_velocity = predicted_positions - current_positions if self.use_velocity else None
-                current_positions = predicted_positions
-        return torch.stack(outputs, dim=1)
+
+def build_joint_gru(config: RunConfig) -> JointGRUForecastModel:
+    common = config.model.common
+    return JointGRUForecastModel(
+        input_dim=config.input_dim,
+        num_entities=config.experiment.num_entities,
+        context_size=config.experiment.context_size,
+        horizon_size=config.experiment.horizon_size,
+        hidden_dim=common.hidden_dim,
+        num_layers=common.num_layers,
+        dropout=common.dropout,
+    )

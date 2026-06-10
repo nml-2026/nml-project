@@ -1,8 +1,0 @@
-extends = "e3_dynamic_graph_direct.toml"
-
-[experiment]
-name = "e3_dynamic_graph_mp_ssm"
-model_name = "e3_dynamic_graph"
-
-[model]
-message_passing_type = "mp_ssm"

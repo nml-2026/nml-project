@@ -1,0 +1,20 @@
+extends = "graph_transformer_mdn.toml"
+
+[experiment]
+name = "tune_graph_transformer"
+
+[features.augmentation]
+context_noise_std_ft = 0.0
+context_frame_dropout_prob = 0.0
+context_frame_dropout_mode = "previous"
+
+[training]
+epochs = 100
+patience = 100
+max_train_batches = 0
+max_val_batches = 0
+num_workers = -1
+
+[evaluation]
+num_examples = 1
+tta_group = "none"

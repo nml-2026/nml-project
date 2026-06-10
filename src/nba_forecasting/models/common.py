@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import torch
 from torch import nn
@@ -26,7 +26,59 @@ def _static_features(context: torch.Tensor) -> torch.Tensor:
     return context[:, 0, :, -2:]
 
 
-class TypeConditionedDeltaHead(nn.Module):
+def _full_graph_mask(batch_size: int, num_entities: int, device: torch.device) -> torch.Tensor:
+    mask = torch.ones(batch_size, num_entities, num_entities, device=device, dtype=torch.bool)
+    eye = torch.eye(num_entities, device=device, dtype=torch.bool).unsqueeze(0)
+    return mask & ~eye
+
+
+def _semantic_graph_mask(static: torch.Tensor) -> torch.Tensor:
+    teams = static[:, :, 1]
+    team_i = teams.unsqueeze(2)
+    team_j = teams.unsqueeze(1)
+    same_team = (team_i == team_j) & (team_i != 0) & (team_j != 0)
+    involves_ball = (team_i == 0) | (team_j == 0)
+    num_entities = static.shape[1]
+    mask = same_team | involves_ball
+    eye = torch.eye(num_entities, device=static.device, dtype=torch.bool).unsqueeze(0)
+    return mask & ~eye
+
+
+def _knn_graph_mask(positions: torch.Tensor, k_neighbors: int) -> torch.Tensor:
+    batch_size, num_entities, _ = positions.shape
+    distances = torch.cdist(positions, positions)
+    eye = torch.eye(num_entities, device=positions.device, dtype=torch.bool).unsqueeze(0)
+    distances = distances.masked_fill(eye, float("inf"))
+    k_neighbors = max(1, min(k_neighbors, num_entities - 1))
+    neighbors = distances.topk(k=k_neighbors, largest=False).indices
+    mask = torch.zeros(batch_size, num_entities, num_entities, device=positions.device, dtype=torch.bool)
+    mask.scatter_(2, neighbors, True)
+    return mask | mask.transpose(1, 2)
+
+
+def _edge_features(positions: torch.Tensor, static: torch.Tensor, use_semantic_flags: bool) -> torch.Tensor:
+    pos_i = positions.unsqueeze(2)
+    pos_j = positions.unsqueeze(1)
+    delta = pos_j - pos_i
+    distance = torch.linalg.norm(delta, dim=-1, keepdim=True)
+    features = [delta, distance]
+    if use_semantic_flags:
+        teams = static[:, :, 1]
+        team_i = teams.unsqueeze(2)
+        team_j = teams.unsqueeze(1)
+        same_team = ((team_i == team_j) & (team_i != 0) & (team_j != 0)).float().unsqueeze(-1)
+        involves_ball = ((team_i == 0) | (team_j == 0)).float().unsqueeze(-1)
+        features.extend([same_team, involves_ball])
+    return torch.cat(features, dim=-1)
+
+
+class ForecasterHead(nn.Module):
+    """Base seam for forecasting trajectory heads."""
+
+    pass
+
+
+class TypeConditionedDeltaHead(ForecasterHead):
     def __init__(self, hidden_dim: int, dropout: float, separate_ball_head: bool) -> None:
         super().__init__()
         self.separate_ball_head = separate_ball_head
@@ -59,7 +111,7 @@ class TypeConditionedDeltaHead(nn.Module):
 
 
 class MixtureParams(NamedTuple):
-    """Parameters of a per-entity Gaussian mixture over trajectories (Phase 7 / D1).
+    """Parameters of a per-entity Gaussian mixture over trajectories.
 
     All tensors live in the model's (normalized) position space. ``K`` is the number of
     mixture components. The ``K`` modes share one weight per entity across the horizon, so
@@ -72,7 +124,108 @@ class MixtureParams(NamedTuple):
     log_pi: torch.Tensor  # [B, N, K] per-entity log mixture weights
 
 
-class MixtureDeltaHead(nn.Module):
+class MixtureForecast(NamedTuple):
+    params: MixtureParams
+    student: torch.Tensor | None = None
+
+
+@runtime_checkable
+class MixtureForecaster(Protocol):
+    def mixture_forward(
+        self,
+        context: torch.Tensor,
+        future_xy: torch.Tensor | None = None,
+        teacher_forcing_prob: float = 0.0,
+        scheduled_sampling_prob: float = 0.0,
+    ) -> MixtureParams | MixtureForecast: ...
+
+
+class ForecastOutput(NamedTuple):
+    point: torch.Tensor
+    distribution: MixtureParams | None = None
+    modes: torch.Tensor | None = None
+    auxiliary_loss: torch.Tensor | None = None
+    mode_logits: torch.Tensor | None = None
+    oracle_student: torch.Tensor | None = None
+
+
+@runtime_checkable
+class SampleForecaster(Protocol):
+    def sample_forward(
+        self,
+        context: torch.Tensor,
+        future_xy: torch.Tensor | None = None,
+        teacher_forcing_prob: float = 0.0,
+        scheduled_sampling_prob: float = 0.0,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return getattr(model, "_orig_mod", model)
+
+
+def _forecast_capability_model(model: nn.Module) -> nn.Module:
+    return unwrap_model(model)
+
+
+def forecast_model(
+    model: nn.Module,
+    context: torch.Tensor,
+    *,
+    future_xy: torch.Tensor | None = None,
+    teacher_forcing_prob: float = 0.0,
+    scheduled_sampling_prob: float = 0.0,
+    mdn_point_estimate: str | None = None,
+) -> ForecastOutput:
+    capability_model = _forecast_capability_model(model)
+    if mdn_point_estimate is not None:
+        assert isinstance(capability_model, MixtureForecaster)
+        mixture = capability_model.mixture_forward(
+            context,
+            future_xy=future_xy,
+            teacher_forcing_prob=teacher_forcing_prob,
+            scheduled_sampling_prob=scheduled_sampling_prob,
+        )
+        if isinstance(mixture, MixtureForecast):
+            params = mixture.params
+            student = mixture.student
+        else:
+            params = mixture
+            student = None
+        if mdn_point_estimate == "student":
+            if student is None:
+                raise RuntimeError("mdn_point_estimate='student' requires an oracle student head.")
+            point = student
+        else:
+            point = reduce_mixture(params.means, params.log_pi, mdn_point_estimate)
+        return ForecastOutput(point=point, distribution=params, modes=params.means, mode_logits=params.log_pi, oracle_student=student)
+    raw: Any = model(
+        context,
+        future_xy=future_xy,
+        teacher_forcing_prob=teacher_forcing_prob,
+        scheduled_sampling_prob=scheduled_sampling_prob,
+    )
+    if isinstance(raw, ForecastOutput):
+        return raw
+    assert isinstance(raw, torch.Tensor)
+    if isinstance(capability_model, SampleForecaster):
+        sample_output = capability_model.sample_forward(
+            context,
+            future_xy=future_xy,
+            teacher_forcing_prob=teacher_forcing_prob,
+            scheduled_sampling_prob=scheduled_sampling_prob,
+        )
+        if isinstance(sample_output, tuple):
+            modes, auxiliary_loss = sample_output
+        else:
+            modes = sample_output
+            auxiliary_loss = None
+        point = modes.mean(dim=3)
+        return ForecastOutput(point=point, modes=modes, auxiliary_loss=auxiliary_loss)
+    return ForecastOutput(point=raw)
+
+
+class MixtureDeltaHead(ForecasterHead):
     """Gaussian-mixture trajectory head: K coherent modes with per-entity weights.
 
     Emits, per (step, entity, component), a position-*delta* mean (2), log-sigma (2) and
@@ -148,7 +301,8 @@ def reduce_mixture(means: torch.Tensor, log_pi: torch.Tensor, point_estimate: st
 
     ``"mean"`` returns the per-entity pi-weighted mean of the mode means (the Bayes-optimal
     estimate for the competition's squared metric); ``"mode"`` returns the highest-weight
-    mode's trajectory. ``means`` is ``[B, T, N, K, 2]`` and ``log_pi`` is ``[B, N, K]``.
+    mode's trajectory; ``"medoid"`` returns the mode with minimum aggregate distance to all
+    other modes. ``means`` is ``[B, T, N, K, 2]`` and ``log_pi`` is ``[B, N, K]``.
     """
     if point_estimate == "mean":
         batch_size, num_entities, num_components = log_pi.shape
@@ -158,7 +312,14 @@ def reduce_mixture(means: torch.Tensor, log_pi: torch.Tensor, point_estimate: st
         best = log_pi.argmax(dim=-1)  # [B, N]
         index = best.view(best.shape[0], 1, best.shape[1], 1, 1).expand(-1, means.shape[1], -1, -1, means.shape[-1])
         return torch.gather(means, 3, index).squeeze(3)
-    raise ValueError(f"Unknown point_estimate {point_estimate!r}. Expected 'mean' or 'mode'.")
+    if point_estimate == "medoid":
+        # Pairwise summed squared distance over horizon and xy: [B, N, K, K].
+        modes = means.permute(0, 2, 3, 1, 4)
+        pairwise = (modes.unsqueeze(3) - modes.unsqueeze(2)).square().sum(dim=(-1, -2))
+        best = pairwise.sum(dim=-1).argmin(dim=-1)
+        index = best.view(best.shape[0], 1, best.shape[1], 1, 1).expand(-1, means.shape[1], -1, -1, means.shape[-1])
+        return torch.gather(means, 3, index).squeeze(3)
+    raise ValueError(f"Unknown point_estimate {point_estimate!r}. Expected 'mean', 'mode', or 'medoid'.")
 
 
 def _next_autoregressive_inputs(

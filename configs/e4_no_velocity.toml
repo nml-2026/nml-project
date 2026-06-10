@@ -1,8 +1,0 @@
-extends = "e3_dynamic_graph.toml"
-
-[experiment]
-name = "e4_no_velocity"
-model_name = "e3_dynamic_graph"
-
-[features]
-use_velocity = false

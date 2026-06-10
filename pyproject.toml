@@ -39,10 +39,19 @@ cu128 = [
   "torch>=2.0",
   "setuptools>=70",
 ]
+cu130 = [
+  "torch>=2.0",
+  "setuptools>=70",
+]
+cu132 = [
+  "torch>=2.0",
+  "setuptools>=70",
+]
 dev = [
   "pre-commit>=4.0",
   "pytest>=8.0",
   "ruff>=0.15.11",
+  "ty>=0.0.43",
 ]
 
 [project.scripts]
@@ -85,6 +94,14 @@ conflicts = [
     { extra = "cu128" },
   ],
   [
+    { extra = "cpu" },
+    { extra = "cu130" },
+  ],
+  [
+    { extra = "cpu" },
+    { extra = "cu132" },
+  ],
+  [
     { extra = "cu121" },
     { extra = "cu124" },
   ],
@@ -93,9 +110,37 @@ conflicts = [
     { extra = "cu128" },
   ],
   [
+    { extra = "cu121" },
+    { extra = "cu130" },
+  ],
+  [
+    { extra = "cu121" },
+    { extra = "cu132" },
+  ],
+  [
     { extra = "cu124" },
     { extra = "cu128" },
   ],
+  [
+    { extra = "cu124" },
+    { extra = "cu130" },
+  ],
+  [
+    { extra = "cu124" },
+    { extra = "cu132" },
+  ],
+  [
+    { extra = "cu128" },
+    { extra = "cu130" },
+  ],
+  [
+    { extra = "cu128" },
+    { extra = "cu132" },
+  ],
+  [
+    { extra = "cu130" },
+    { extra = "cu132" },
+  ]
 ]
 
 [[tool.uv.index]]
@@ -113,9 +158,21 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
 [tool.uv.sources]
 torch = [
   { index = "pytorch-cu121", extra = "cu121" },
   { index = "pytorch-cu124", extra = "cu124" },
   { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu130", extra = "cu130" },
+  { index = "pytorch-cu130", extra = "cu132" },
 ]

@@ -3,8 +3,10 @@
 The implemented models live under `src/nba_forecasting/models/`. The public entry point is:
 
 ```python
-from nba_forecasting.models import build_model
+from nba_forecasting.models import MODEL_FAMILIES, build_model
 ```
+
+Model families are registered in `models/builders.py` with `FamilySpec` metadata (`builder`, `loss_modes`, `search_profiles`). Loss compatibility is validated at config load time.
 
 Experiment starting points are TOML files under `configs/`. These configs are normal full-run defaults; quick tests should use runtime overrides such as `--epochs`, `training.max_train_batches`, and `training.max_val_batches`.
 
@@ -16,7 +18,7 @@ Each example uses 8 observed time steps for 11 entities: 10 players plus the bal
 [x, y, isplayer, team]
 ```
 
-Most non-reference configs also enable velocity:
+Velocity features (`vx`, `vy` as finite differences of normalized positions) are controlled by `features.use_velocity`. The default in `base.toml` is `true` (graph models, graph Transformer, MART). GRU reference configs (`baseline.toml`, `joint_gru.toml`) keep `use_velocity = false` because those families use the position-only feature layout. When enabled, the per-step vector is:
 
 ```text
 [x, y, vx, vy, isplayer, team]
@@ -24,119 +26,96 @@ Most non-reference configs also enable velocity:
 
 The target is the next 12 `(x, y)` positions for all 11 entities.
 
-## Baselines
+## Supported Model Families
 
-### `e0_reference`
+### `baseline` (`BaselineModel`)
 
-Reference non-graph baseline. It is intentionally simple and close to the original notebook-style model. It runs a small custom GRU cell independently per entity, uses no velocity features, and predicts positions autoregressively.
+Reference non-graph baseline close to the original notebook-style model. It runs a small custom GRU cell independently per entity, uses no velocity features, and predicts positions autoregressively.
 
-### `e1_joint_gru`
+### `joint_gru` (`JointGRUForecastModel`)
 
-Stronger non-graph baseline. It flattens all entities and features at each time step, encodes the 8-step context with a GRU, then directly predicts the full 12-step future for all entities. It can model interactions only implicitly through the joint flattened representation.
+Flattens all 11 entities into one joint GRU encoder over the observed context, then decodes all 12 horizon steps in a single direct head. No graph structure; tests whether explicit interaction modeling is necessary.
 
-### `e1_joint_autoreg_gru`
+### `static_graph` (`StaticGraphDirectModel`)
 
-Autoregressive version of the joint GRU. It encodes the context jointly, then rolls out one step at a time with a GRUCell, predicting position deltas. During training it supports teacher forcing and scheduled sampling through the shared training loop.
+Static full-graph MPNN over entities at each context step, followed by a joint temporal GRU and direct multi-step decoder. Graph topology is fixed (not position-dependent); edge features may still use semantic flags.
 
-## SSM Baseline
+### `dynamic_graph_autoregressive` (`DynamicGraphAutoregressiveModel`)
 
-### `e1_social_ssm`
+Dynamic kNN graph MPNN with per-entity node GRU state and autoregressive delta decoding over the 12-step horizon. Supports teacher forcing and scheduled sampling during training.
 
-Non-GNN state-space baseline with explicit social mixing. It first applies SSM blocks over each entity's temporal context. Then it builds a social sequence for each entity by sorting other entities by distance, projects edge features, and applies social SSM layers. A learned gate fuses temporal and social states, and an SSM decoder predicts the horizon.
+### `dynamic_graph_direct`
 
-This tests whether SSM-style temporal/social modeling is competitive without graph message passing.
+Direct-decoder dynamic graph model. At each observed time step, the graph is rebuilt from current positions using k-nearest neighbors, optionally unioned with semantic edges. A node GRU maintains per-entity temporal state, then a horizon-query decoder predicts all 12 future steps in one pass.
 
-## Graph Models
-
-### `e2_static_graph`
-
-Static graph baseline. For each observed time step, it applies graph layers over a fixed full entity graph, using edge features based on relative position, distance, and optional semantic flags. The per-step graph embeddings are flattened and passed through a GRU over time, then decoded directly into the full future horizon.
-
-### `e2_static_graph_gat`
-
-Same as `e2_static_graph`, but swaps the graph layer from MPNN-style message aggregation to edge-aware attention.
-
-### `e3_dynamic_graph`
-
-Main dynamic graph autoregressive model. At each time step, the graph is rebuilt from current positions using k-nearest neighbors, optionally unioned with semantic edges. A node GRU maintains per-entity temporal state. During prediction, it rolls forward autoregressively, repeatedly rebuilding graph features from predicted positions and predicting deltas.
-
-### `e3_dynamic_graph_direct`
-
-Direct-decoder dynamic graph model. It uses the same dynamic graph encoder idea, but instead of rolling out step by step, it decodes all 12 future steps with learned horizon queries and cross-attention over the encoded entity states.
-
-The config also enables relation types, entity embeddings, a separate ball head, wider hidden dimensions, and larger k-neighborhoods.
-
-### `e3_dynamic_graph_attention`
-
-Same direct-decoder setup as `e3_dynamic_graph_direct`, but uses edge-aware attention for graph message passing. This is the lightweight graph-attention baseline over the 11 entities.
-
-### `e3_dynamic_graph_mp_ssm`
-
-Same direct-decoder setup as `e3_dynamic_graph_direct`, but uses an SSM-inspired message-passing layer. It keeps the standard graph interface while replacing plain mean aggregation with a gated node/message update.
-
-## Graph + SSM Models
-
-### `e3_graph_ssm`
-
-Combines graph encoding with SSM-style temporal and social processing. First, each observed step is graph-encoded. Then temporal SSM layers process each entity's sequence of graph states. A social SSM block mixes entities based on egocentric distance-sorted social inputs that exclude the target entity itself. A gated fusion combines temporal and social states, and an SSM decoder predicts all horizon steps directly.
-
-### `e3_graph_ssm_no_social`
-
-Removes the learned social SSM layers from `e3_graph_ssm`. This is a true no-social path: the graph-temporal state bypasses the social branch before decoding.
+The default config enables relation types, entity embeddings, a separate ball head, wider hidden dimensions, and larger k-neighborhoods.
 
 ## Graph Transformer
 
-### `e5_graph_transformer`
+### `graph_transformer`
 
 Spatiotemporal Transformer candidate with an explicit graph component. Each encoder stage alternates graph-masked spatial attention over entities with temporal attention over the observed context for each entity. Spatial attention is restricted by the dynamic graph and receives learned edge bias from relative position, distance, and semantic edge features.
 
-The decoder builds horizon/entity query tokens and applies graph attention again before predicting cumulative position deltas. This means graph structure affects both context encoding and horizon decoding.
+The decoder builds horizon/entity query tokens and applies graph attention again before predicting cumulative position deltas.
 
-### `e5_graph_transformer_no_graph`
+Graph ablations (`no_graph`, `shuffled_graph`) are available via `model.graph_transformer.graph_ablation_mode` overrides rather than separate configs:
 
-Matched ablation for `e5_graph_transformer`. It keeps the same model capacity but replaces graph masks with dense entity attention and removes edge bias. This is not final-model eligible.
+```bash
+python -m nba_forecasting train --config graph_transformer \
+  --set model.graph_transformer.graph_ablation_mode=no_graph
+```
 
-### `e5_graph_transformer_shuffled_graph`
+## MART
 
-Matched ablation for `e5_graph_transformer`. It keeps sparse graph-style masking but corrupts neighbor identity. This is not final-model eligible.
+### `mart` (`mart_hypergraph`)
 
-Treat `e5_graph_transformer` as a serious final candidate only if matched-budget validation runs beat both ablations.
+MART is included as a **published external baseline**, not as original architecture work in this repo. We port the official PyTorch implementation (MIT license; see the header in `src/nba_forecasting/models/mart.py`) and wire it into the same training, evaluation, and submission stack as our graph models.
 
-## Current Ablation Configs
+#### Citation
 
-### `e4_no_dynamic_edges`
+- **Paper:** *MART: Multi-Agent Relational Transformer for Multi-Agent Trajectory Prediction*, arXiv:2407.21635 (2024) — [https://arxiv.org/abs/2407.21635](https://arxiv.org/abs/2407.21635)
+- **Code:** [`gist-ailab/MART`](https://github.com/gist-ailab/MART) (ported in `src/nba_forecasting/models/mart.py`)
 
-Extends `e3_dynamic_graph`, but disables dynamic kNN edges. This tests whether rebuilding the graph from positions is useful.
+#### Prior work (architecture we reuse)
 
-### `e4_no_semantic_flags`
+The ported encoder follows the official implementation:
 
-Extends `e3_dynamic_graph`, but removes semantic edge flags such as same-team and involves-ball indicators. This tests whether basketball-specific metadata improves graph reasoning.
+- Per-entity temporal embedding with positional encoding over the observed context
+- Parallel **pair-wise relational Transformer** (`MARTRT`) and **hyper-relational Transformer** (`HRT`) branches
+- An adaptive group estimator in the hypergraph branch
+- A multi-mode decoder head that predicts $K$ trajectory samples per entity
 
-### `e4_no_velocity`
+We do **not** claim the hypergraph design, the pair/hyper branches, or the group estimator as our contribution.
 
-Extends `e3_dynamic_graph`, but removes velocity features. This tests whether explicit velocity helps beyond raw position history.
+#### Our work (integration and recipe)
+
+What we implemented or chose for the NBA benchmark:
+
+| Area | What we did |
+| --- | --- |
+| **Pipeline** | `FamilySpec` registration, `mart.toml` / `tune_mart.toml`, shared data loaders, augmentations, trainer, checkpointing, xy TTA evaluation, and Kaggle submission |
+| **Input adapter** | Map NBA tensors `[x, y, (vx, vy), isplayer, team]` into MART's expected layout (inherits `use_velocity=true` from `base.toml`) |
+| **Decoder variant** | `mart_decoder_variant = "type_conditioned"` — separate ball/player bias on top of the ported multi-mode head |
+| **Inference aggregation** | `mart_point_aggregation = "learned_softmax"` — learned weights over the $K{=}20$ modes at eval/submit time |
+| **Training loss** | `loss.sample_loss_type = "softmin_ade"` with `loss.sample_loss_space = "raw"` (**softmin-raw**): temperature-weighted minADE in denormalized court coordinates, with tuned `softmin_temperature` and `raw_loss_scale_ft` |
+| **Hyperparameters** | Ray Tune sweep (`tune_mart.toml`, `scripts/run_tune.sh`) merged into `mart.toml` (lr, schedule, width, `mart_function_type`, etc.) |
+| **Protocol** | Same frozen split as other families; report-table `mart` uses reflect xy and agent permutation ($p{=}0.5$ each, `base.toml`); 100 epochs because validation was still improving at 80 |
+| **Aug ablations** | `mart_aug_none`, `mart_aug_reflect`, `mart_aug_perm` isolate train-time reflection vs.\ agent permutation (see [experiments.md](experiments.md#mart-augmentation-ablations)) |
+
+Optional knobs we added on top of the port (not used in the report table): Gaussian per-mode distributions (`mart_mode_distribution = "gaussian"`), alternate aggregations (`mean`, `argmax`, `distribution_*`), and additional loss modes wired through `resolve_training_loss_policy`.
+
+For experiment commands and matched-budget comparison details, see [experiments.md](experiments.md).
 
 ## Additional Tunables
 
 The code supports several knobs that are not all exposed as separate configs:
 
-- `message_passing_type`: MPNN, GAT-style attention, or SSM-inspired graph message passing.
-- `decoder_type`: autoregressive vs direct horizon decoding for dynamic graph models.
 - `use_relation_types`: typed same-team / opponent / ball relations.
 - `use_entity_embeddings`: learned embeddings for player/ball and team identity.
 - `separate_ball_head`: separate output head for ball dynamics.
 - `k_neighbors`: graph sparsity for dynamic edges.
-- `edge_radius`: optional distance cutoff.
-- `temporal_ssm_layers`, `social_ssm_layers`, `decoder_ssm_layers`: where SSM capacity matters.
 - `transformer_heads`, `spatial_layers`, `temporal_layers`, `decoder_layers`, `transformer_ffn_multiplier`: graph Transformer capacity.
 - `graph_ablation_mode`: normal, no-graph, or shuffled-graph behavior for graph Transformer ablations.
-- `optimization_backend`, `optimizer_backend`, `training.mixed_precision`: global runtime optimization flags. CUDA runs use `torch.compile`, fused AdamW, and autocast when requested; CPU and MPS runs fall back to eager execution, standard AdamW, and fp32.
-- `teacher_forcing_prob` / `scheduled_sampling_final_prob`: rollout training strategy for autoregressive models.
-
-## Main Comparisons
-
-The first experiments should make three comparisons clear:
-
-- Non-graph baselines vs graph models.
-- Autoregressive rollout vs direct horizon decoding.
-- GRU-style temporal modeling vs SSM-style temporal/social modeling.
+- `head_type`, `mdn_components`, `mdn_point_estimate`: Graph Transformer delta vs MDN forecast heads.
+- `mart_function_type`, `mart_hyper_scale`, `mart_decoder_hidden_dim`, `mart_sample_k`, `mart_point_aggregation`, `mart_decoder_variant`, `mart_mode_distribution`: MART hypergraph capacity, multi-mode decoding, and aggregation behavior.
+- `optimization_backend`, `optimizer_backend`, `runtime.mixed_precision`: global runtime optimization flags. CUDA tuned runs default to `torch.compile`, fused AdamW, and mixed precision; CPU and MPS runs fall back to eager execution, standard AdamW, and fp32.

@@ -13,52 +13,11 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import load_config, parse_override_value, resolve_config_paths
+from .models.builders import collect_search_profiles
 
 SEARCH_PATTERN = re.compile(r"^(?P<kind>[a-z_]+)\((?P<body>.*)\)$")
-SEARCH_PROFILES: dict[str, list[str]] = {
-    "basic": [
-        "model.hidden_dim=choice(128,192,256)",
-        "training.lr=loguniform(1e-4,5e-3)",
-        "model.dropout=uniform(0.0,0.2)",
-    ],
-    "graph": [
-        "model.hidden_dim=choice(128,192,256)",
-        "training.lr=loguniform(1e-4,5e-3)",
-        "model.dropout=uniform(0.0,0.2)",
-        "model.message_dim=choice(128,192,256)",
-        "model.k_neighbors=choice(3,5,7)",
-        "model.message_passing_type=choice(mpnn,gat,mp_ssm)",
-    ],
-    "graph_fixed_message": [
-        "model.hidden_dim=choice(128,192,256)",
-        "training.lr=loguniform(1e-4,5e-3)",
-        "model.dropout=uniform(0.0,0.2)",
-        "model.message_dim=choice(128,192,256)",
-        "model.k_neighbors=choice(3,5,7)",
-    ],
-    "graph_ssm": [
-        "model.hidden_dim=choice(128,192,256)",
-        "training.lr=loguniform(1e-4,5e-3)",
-        "model.dropout=uniform(0.0,0.2)",
-        "model.message_dim=choice(128,192,256)",
-        "model.k_neighbors=choice(3,5,7)",
-        "model.message_passing_type=choice(mpnn,mp_ssm)",
-        "model.temporal_ssm_layers=choice(1,2,3)",
-        "model.social_ssm_layers=choice(0,1,2)",
-        "model.decoder_ssm_layers=choice(1,2,3)",
-        "model.ssm_conv_kernel=choice(3,5)",
-    ],
-    "graph_transformer": [
-        "model.hidden_dim=choice(128,192,256)",
-        "training.lr=loguniform(1e-4,5e-3)",
-        "model.dropout=uniform(0.0,0.2)",
-        "model.k_neighbors=choice(3,5,7)",
-        "model.transformer_heads=choice(4,8)",
-        "model.spatial_layers=choice(1,2,3)",
-        "model.temporal_layers=choice(1,2,3)",
-        "model.decoder_layers=choice(1,2)",
-        "model.transformer_ffn_multiplier=choice(2.0,3.0)",
-    ],
+FAILED_TRIAL_METRIC = 1e9
+RUNTIME_SEARCH_PROFILES: dict[str, list[str]] = {
     "aux_losses": [
         "loss.lambda_smooth=loguniform(1e-4,2e-1)",
         "loss.lambda_boundary=loguniform(1e-4,2e-1)",
@@ -69,6 +28,7 @@ SEARCH_PROFILES: dict[str, list[str]] = {
         "training.swa_lr=loguniform(5e-5,3.5e-4)",
     ],
 }
+SEARCH_PROFILES: dict[str, list[str]] = {**collect_search_profiles(), **RUNTIME_SEARCH_PROFILES}
 
 
 def resolve_search_specs(profile: str | None, search_specs: list[str] | None = None) -> list[str]:
@@ -125,12 +85,18 @@ def _parse_search_expression(raw_expression: str, tune):
         return tune.grid_search(_parse_list(body))
     if kind == "uniform":
         low, high = _parse_list(body)
+        assert isinstance(low, (int, float, str))
+        assert isinstance(high, (int, float, str))
         return tune.uniform(float(low), float(high))
     if kind == "loguniform":
         low, high = _parse_list(body)
+        assert isinstance(low, (int, float, str))
+        assert isinstance(high, (int, float, str))
         return tune.loguniform(float(low), float(high))
     if kind == "randint":
         low, high = _parse_list(body)
+        assert isinstance(low, (int, float, str))
+        assert isinstance(high, (int, float, str))
         return tune.randint(int(low), int(high))
     raise ValueError(
         f"Unsupported Ray Tune search expression {raw_expression!r}. "
@@ -173,6 +139,14 @@ class TrainableTimingTrace:
             handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
 
 
+class TrialPrunedByMetric(RuntimeError):
+    def __init__(self, report: dict[str, object], *, metric_name: str, threshold: float) -> None:
+        super().__init__(f"{metric_name} exceeded prune threshold {threshold}.")
+        self.report = report
+        self.metric_name = metric_name
+        self.threshold = threshold
+
+
 def _runtime_context(ray_module) -> dict[str, object]:
     try:
         gpu_ids = ray_module.get_gpu_ids()
@@ -202,12 +176,21 @@ def _runtime_context(ray_module) -> dict[str, object]:
     }
 
 
-def _last_history_row(run_dir: str | Path) -> dict[str, object]:
+def tune_metric_name(checkpoint_metric: str) -> str:
+    """Ray Tune objective: best validation score seen so far (matches best.pt selection)."""
+    return f"best_val_{checkpoint_metric}"
+
+
+def _read_history_rows(run_dir: str | Path) -> list[dict[str, str]]:
     history_path = Path(run_dir) / "history.csv"
     if not history_path.exists():
-        return {}
+        return []
     with history_path.open(newline="") as handle:
-        rows = list(csv.DictReader(handle))
+        return list(csv.DictReader(handle))
+
+
+def _last_history_row(run_dir: str | Path) -> dict[str, object]:
+    rows = _read_history_rows(run_dir)
     if not rows:
         return {}
     parsed: dict[str, object] = {}
@@ -219,6 +202,52 @@ def _last_history_row(run_dir: str | Path) -> dict[str, object]:
         except ValueError:
             parsed[f"train_history_{key}"] = value
     return parsed
+
+
+def _last_epoch_val_metric(run_dir: str | Path, checkpoint_metric: str) -> float | None:
+    rows = _read_history_rows(run_dir)
+    if not rows:
+        return None
+    key = f"val_{checkpoint_metric}"
+    raw_value = rows[-1].get(key)
+    if raw_value is None:
+        return None
+    try:
+        return float(raw_value)
+    except ValueError:
+        return None
+
+
+def _build_final_tune_report(
+    *,
+    run_dir: str | Path,
+    eval_dir: str | Path,
+    checkpoint_metric: str,
+    metric_name: str,
+    trial_config_arg: str,
+    export_overrides: dict[str, object],
+) -> dict[str, object]:
+    final_metrics = json.loads((Path(eval_dir) / "metrics.json").read_text())
+    train_summary_path = Path(run_dir) / "train_summary.json"
+    train_summary = json.loads(train_summary_path.read_text()) if train_summary_path.exists() else {}
+    best_checkpoint_score = final_metrics.get(checkpoint_metric)
+    if not isinstance(best_checkpoint_score, int | float):
+        raise ValueError(f"Missing numeric {checkpoint_metric!r} in {eval_dir}/metrics.json.")
+
+    report: dict[str, object] = {f"val_{key}": value for key, value in final_metrics.items()}
+    report[metric_name] = float(best_checkpoint_score)
+    report[f"val_{checkpoint_metric}"] = float(best_checkpoint_score)
+    report["best_epoch"] = train_summary.get("best_epoch")
+    report["checkpoint_metric"] = checkpoint_metric
+    last_epoch_score = _last_epoch_val_metric(run_dir, checkpoint_metric)
+    if last_epoch_score is not None:
+        report[f"val_{checkpoint_metric}_last_epoch"] = last_epoch_score
+    report.update(_last_history_row(run_dir))
+    report["config_arg"] = trial_config_arg
+    report["applied_overrides"] = json.dumps(export_overrides, sort_keys=True, default=str)
+    report["run_dir"] = str(run_dir)
+    report["eval_dir"] = str(eval_dir)
+    return report
 
 
 def _local_torch_cuda_device_count() -> int:
@@ -248,6 +277,8 @@ def run_ray_tune_search(
     ray_temp_dir: str | Path | None = None,
     tune_storage_path: str | Path | None = None,
     trace_trainable: bool = False,
+    prune_metric_threshold: float | None = None,
+    prune_min_epoch: int = 1,
 ) -> Path:
     # Ray 2.5x can auto-enable its uv runtime environment when it sees a
     # pyproject.toml. Workers should inherit the already-activated .venv
@@ -275,7 +306,8 @@ def run_ray_tune_search(
     if tune_storage_path:
         tune_storage_root.mkdir(parents=True, exist_ok=True)
     search_space, search_kinds = _build_search_space(search_specs, tune)
-    metric_name = f"val_{config.experiment.checkpoint_metric}"
+    checkpoint_metric = config.experiment.checkpoint_metric
+    metric_name = tune_metric_name(checkpoint_metric)
     if search_algorithm == "optuna" and "grid" in search_kinds:
         raise ValueError(
             "OptunaSearch does not support grid(...) search spaces. Use choice(...), randint(...), uniform(...), or loguniform(...)."
@@ -296,9 +328,11 @@ def run_ray_tune_search(
             trace.mark("heavy_imports_done")
             trace.mark("runtime_context", **_runtime_context(ray))
             trace.mark("checkpoint_restore_skipped")
-        trial_overrides = {}
+        trial_overrides: dict[str, object] = {}
         trial_overrides.update(overrides or {})
         trial_overrides.update(sampled_config)
+        trial_config_arg = resolved_config_arg
+        export_overrides = dict(trial_overrides)
         trial_overrides["experiment.output_root"] = str(output_root / "trial_runs")
 
         def reporter(metrics: dict[str, object]) -> None:
@@ -308,24 +342,60 @@ def run_ray_tune_search(
             if trace is not None and not trace.first_tune_report_seen:
                 trace.mark("first_tune_report_done")
                 trace.first_tune_report_seen = True
+            raw_epoch = metrics.get("epoch", 0)
+            epoch = int(float(raw_epoch)) if isinstance(raw_epoch, int | float | str) else 0
+            metric_value = metrics.get(metric_name)
+            if prune_metric_threshold is not None and epoch >= prune_min_epoch and isinstance(metric_value, int | float):
+                if metric_value > prune_metric_threshold:
+                    report = dict(metrics)
+                    report[metric_name] = FAILED_TRIAL_METRIC
+                    report["checkpoint_metric"] = FAILED_TRIAL_METRIC
+                    report[metric_name] = FAILED_TRIAL_METRIC
+                    report["pruned_by_metric"] = (
+                        f"{metric_name}={float(metric_value):.6g} exceeded threshold {prune_metric_threshold:.6g} at epoch {epoch}"
+                    )
+                    report["config_arg"] = trial_config_arg
+                    report["applied_overrides"] = json.dumps(export_overrides, sort_keys=True, default=str)
+                    raise TrialPrunedByMetric(report, metric_name=metric_name, threshold=prune_metric_threshold)
 
-        run_dir = train_experiment(
-            resolved_config_arg,
-            overrides=trial_overrides,
-            epoch_reporter=reporter,
-            timing_callback=trace.mark if trace is not None else None,
+        try:
+            run_dir = train_experiment(
+                trial_config_arg,
+                overrides=trial_overrides,
+                epoch_reporter=reporter,
+                timing_callback=trace.mark if trace is not None else None,
+            )
+            device_arg = str(trial_overrides.get("experiment.device", config.experiment.device))
+            if trace is not None:
+                trace.mark("final_checkpoint_restore_start", path=str(Path(run_dir) / "best.pt"))
+            eval_dir = evaluate_checkpoint(Path(run_dir) / "best.pt", "val", device_arg=device_arg)
+            if trace is not None:
+                trace.mark("final_checkpoint_restore_done", path=str(Path(run_dir) / "best.pt"), eval_dir=str(eval_dir))
+        except TrialPrunedByMetric as exc:
+            if trace is not None:
+                trace.mark("metric_pruned_trial_terminated", error=str(exc), report=exc.report)
+            tune.report(exc.report)
+            return
+        except FloatingPointError as exc:
+            report = {
+                metric_name: FAILED_TRIAL_METRIC,
+                "checkpoint_metric": checkpoint_metric,
+                "nonfinite_failure": str(exc),
+                "config_arg": trial_config_arg,
+                "applied_overrides": json.dumps(export_overrides, sort_keys=True, default=str),
+            }
+            if trace is not None:
+                trace.mark("nonfinite_trial_terminated", error=str(exc), report=report)
+            tune.report(report)
+            return
+        report = _build_final_tune_report(
+            run_dir=run_dir,
+            eval_dir=eval_dir,
+            checkpoint_metric=checkpoint_metric,
+            metric_name=metric_name,
+            trial_config_arg=trial_config_arg,
+            export_overrides=export_overrides,
         )
-        device_arg = str(trial_overrides.get("experiment.device", config.experiment.device))
-        if trace is not None:
-            trace.mark("final_checkpoint_restore_start", path=str(Path(run_dir) / "best.pt"))
-        eval_dir = evaluate_checkpoint(Path(run_dir) / "best.pt", "val", device_arg=device_arg)
-        if trace is not None:
-            trace.mark("final_checkpoint_restore_done", path=str(Path(run_dir) / "best.pt"), eval_dir=str(eval_dir))
-        final_metrics = json.loads((eval_dir / "metrics.json").read_text())
-        report = {f"val_{key}": value for key, value in final_metrics.items()}
-        report.update(_last_history_row(run_dir))
-        report["run_dir"] = str(run_dir)
-        report["eval_dir"] = str(eval_dir)
         with tempfile.TemporaryDirectory() as checkpoint_dir:
             checkpoint_root = Path(checkpoint_dir)
             if trace is not None:
@@ -336,7 +406,7 @@ def run_ray_tune_search(
             if trace is not None:
                 trace.mark("ray_checkpoint_write_done", checkpoint_dir=str(checkpoint_root))
 
-    resources = {"cpu": cpus_per_trial}
+    resources: dict[str, int | float] = {"cpu": cpus_per_trial}
     if gpus_per_trial > 0:
         resources["gpu"] = gpus_per_trial
         local_gpu_count = _local_torch_cuda_device_count()
@@ -371,7 +441,7 @@ def run_ray_tune_search(
     )
 
     if not ray.is_initialized():
-        ray_init_kwargs = {
+        ray_init_kwargs: dict[str, object] = {
             "include_dashboard": False,
             "ignore_reinit_error": True,
         }
@@ -398,13 +468,35 @@ def run_ray_tune_search(
         )
         results = tuner.fit()
         best_result = results.get_best_result(metric=metric_name, mode="min")
+        best_applied_overrides = None
+        best_source_config = None
+        if isinstance(best_result.metrics, dict):
+            best_source_config = best_result.metrics.get("config_arg")
+            raw_applied = best_result.metrics.get("applied_overrides")
+            if isinstance(raw_applied, str):
+                try:
+                    parsed_applied = json.loads(raw_applied)
+                    if isinstance(parsed_applied, dict):
+                        best_applied_overrides = parsed_applied
+                except json.JSONDecodeError:
+                    best_applied_overrides = None
         rows = []
         for idx, result in enumerate(results):
+            applied_overrides = None
+            if isinstance(result.metrics, dict) and isinstance(result.metrics.get("applied_overrides"), str):
+                try:
+                    parsed = json.loads(str(result.metrics["applied_overrides"]))
+                    if isinstance(parsed, dict):
+                        applied_overrides = parsed
+                except json.JSONDecodeError:
+                    applied_overrides = None
             rows.append(
                 {
                     "trial": idx,
                     "path": result.path,
                     "config": result.config,
+                    "source_config": result.metrics.get("config_arg") if isinstance(result.metrics, dict) else None,
+                    "applied_overrides": applied_overrides,
                     "metrics": result.metrics,
                     "error": None if result.error is None else str(result.error),
                 }
@@ -419,6 +511,7 @@ def run_ray_tune_search(
             "search_algorithm": search_algorithm,
             "scheduler": scheduler_name,
             "metric": metric_name,
+            "checkpoint_metric": checkpoint_metric,
             "training_epochs": config.training.epochs,
             "training_max_train_batches": config.training.max_train_batches,
             "training_max_val_batches": config.training.max_val_batches,
@@ -431,9 +524,13 @@ def run_ray_tune_search(
             "tune_storage_path": str(tune_storage_root),
             "tune_run_name": tune_run_name,
             "trace_trainable": trace_trainable,
+            "prune_metric_threshold": prune_metric_threshold,
+            "prune_min_epoch": prune_min_epoch,
             "best_trial": {
                 "path": best_result.path,
-                "config": best_result.config,
+                "source_config": best_source_config or str(config_path),
+                "sampled_config": best_result.config,
+                "config": best_applied_overrides or best_result.config,
                 "metrics": best_result.metrics,
             },
             "trials": rows,

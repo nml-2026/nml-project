@@ -1,0 +1,9 @@
+extends = "graph_transformer.toml"
+
+[experiment]
+name = "graph_transformer_mdn"
+
+[model.head]
+head_type = "mdn"
+mdn_components = 3
+mdn_point_estimate = "mean"

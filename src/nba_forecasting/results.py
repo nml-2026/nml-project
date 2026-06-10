@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import math
 import os
 import re
 from dataclasses import asdict, is_dataclass
@@ -53,6 +52,12 @@ def _compact_params(params: dict[str, Any]) -> str:
     return json.dumps(params, sort_keys=True, separators=(",", ":"))
 
 
+def _ray_tune_val_ade(metrics: dict[str, Any], summary: dict[str, Any]) -> float | None:
+    checkpoint_metric = str(summary.get("checkpoint_metric", "ade"))
+    best_metric_key = f"best_val_{checkpoint_metric}"
+    return _metric_value(metrics, best_metric_key) or _metric_value(metrics, f"val_{checkpoint_metric}")
+
+
 def _ray_row(summary_path: Path) -> dict[str, Any]:
     summary = _read_json(summary_path)
     best_trial = summary.get("best_trial", {})
@@ -63,7 +68,7 @@ def _ray_row(summary_path: Path) -> dict[str, Any]:
     return {
         "source": "ray_tune",
         "config": config,
-        "val_ade": _metric_value(metrics, "val_ade"),
+        "val_ade": _ray_tune_val_ade(metrics, summary),
         "tuned_params": _compact_params(best_trial.get("config", {}) if isinstance(best_trial, dict) else {}),
         "checkpoint": _checkpoint_from_metrics(metrics),
         "run_dir": str(metrics.get("run_dir", "")),
@@ -154,259 +159,6 @@ def format_results_markdown(rows: list[dict[str, Any]]) -> str:
     return "\n".join(table) + "\n"
 
 
-def _summary_elapsed_s(summary: dict[str, Any]) -> float | None:
-    value = summary.get("elapsed_s")
-    if isinstance(value, int | float) and value > 0:
-        return float(value)
-    trial_times = [
-        metrics.get("time_total_s")
-        for trial in summary.get("trials", [])
-        if isinstance(trial, dict)
-        for metrics in [trial.get("metrics", {})]
-        if isinstance(metrics, dict) and isinstance(metrics.get("time_total_s"), int | float)
-    ]
-    if trial_times:
-        return max(float(value) for value in trial_times)
-    return None
-
-
-def collect_runtime_rows(root: str | Path) -> list[dict[str, Any]]:
-    search_root = Path(root)
-    rows: list[dict[str, Any]] = []
-    if not search_root.exists():
-        return rows
-    for summary_path in sorted(search_root.rglob("ray_tune_summary.json")):
-        summary = _read_json(summary_path)
-        config_path = str(summary.get("config", ""))
-        trials = [trial for trial in summary.get("trials", []) if isinstance(trial, dict)]
-        errors = [trial for trial in trials if trial.get("error")]
-        rows.append(
-            {
-                "config": Path(config_path).stem if config_path else "",
-                "summary_path": str(summary_path),
-                "job_id": _job_id_from_path(summary_path),
-                "elapsed_s": _summary_elapsed_s(summary),
-                "num_samples": int(summary.get("num_samples", len(trials)) or len(trials) or 0),
-                "completed_trials": len(trials) - len(errors),
-                "errored_trials": len(errors),
-                "training_epochs": int(summary.get("training_epochs") or 0),
-                "max_train_batches": int(summary.get("training_max_train_batches") or 0),
-                "max_val_batches": int(summary.get("training_max_val_batches") or 0),
-                "max_concurrent_trials": int(summary.get("max_concurrent_trials") or 1),
-            }
-        )
-    return rows
-
-
-def _format_duration(seconds: float | None) -> str:
-    if seconds is None:
-        return ""
-    minutes = int(round(seconds / 60))
-    hours, rem_minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}h {rem_minutes:02d}m"
-    return f"{rem_minutes}m"
-
-
-def _project_runtime_s(row: dict[str, Any], target_samples: int, target_epochs: int) -> float | None:
-    elapsed_s = row.get("elapsed_s")
-    observed_samples = int(row.get("num_samples") or 0)
-    observed_epochs = int(row.get("training_epochs") or 0)
-    max_concurrent = max(1, int(row.get("max_concurrent_trials") or 1))
-    if not isinstance(elapsed_s, int | float) or elapsed_s <= 0 or observed_samples <= 0 or observed_epochs <= 0:
-        return None
-    observed_waves = math.ceil(observed_samples / max_concurrent)
-    target_waves = math.ceil(target_samples / max_concurrent)
-    return float(elapsed_s) * (target_waves / observed_waves) * (target_epochs / observed_epochs)
-
-
-def format_runtime_estimate_markdown(rows: list[dict[str, Any]], target_samples: int, target_epochs: int) -> str:
-    columns = [
-        "config",
-        "observed",
-        "samples",
-        "epochs",
-        "concurrency",
-        "projection",
-        "notes",
-    ]
-    table = ["| " + " | ".join(columns) + " |", "| " + " | ".join("---" for _ in columns) + " |"]
-    total_s = 0.0
-    complete_estimates = True
-    for row in rows:
-        projected_s = _project_runtime_s(row, target_samples, target_epochs)
-        if projected_s is None:
-            complete_estimates = False
-        else:
-            total_s += projected_s
-        notes = []
-        if row.get("errored_trials"):
-            notes.append(f"{row['errored_trials']} errored")
-        if row.get("max_train_batches") or row.get("max_val_batches"):
-            notes.append("batch-limited")
-        values = [
-            str(row.get("config", "")),
-            _format_duration(row.get("elapsed_s")),
-            str(row.get("num_samples", "")),
-            str(row.get("training_epochs", "")),
-            str(row.get("max_concurrent_trials", "")),
-            _format_duration(projected_s),
-            ", ".join(notes),
-        ]
-        table.append("| " + " | ".join(value.replace("|", "\\|") for value in values) + " |")
-    if rows and complete_estimates:
-        table.append("")
-        table.append(f"Projected sequential total for observed configs: **{_format_duration(total_s)}**.")
-    elif rows:
-        table.append("")
-        table.append("Projected total unavailable because at least one summary lacks timing metadata.")
-    else:
-        table.append("")
-        table.append("No Ray Tune summaries found.")
-    return "\n".join(table) + "\n"
-
-
-def collect_timing_trace_rows(root: str | Path) -> list[dict[str, Any]]:
-    search_root = Path(root)
-    if not search_root.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    for trace_path in sorted(search_root.rglob("trainable_timing/*.jsonl")):
-        events: dict[str, dict[str, Any]] = {}
-        for line in trace_path.read_text().splitlines():
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            event = row.get("event")
-            if isinstance(event, str):
-                events[event] = row
-        rows.append(
-            {
-                "trace": str(trace_path),
-                "job_id": _job_id_from_path(trace_path),
-                "trial_start_s": _event_elapsed(events, "trial_start"),
-                "imports_s": _event_delta(events, "heavy_imports_start", "heavy_imports_done"),
-                "dataset_s": _event_delta(events, "dataset_loading_start", "dataset_loading_done"),
-                "dataloader_s": _event_delta(events, "dataloader_construction_start", "dataloader_construction_done"),
-                "model_s": _event_delta(events, "model_construction_start", "model_construction_done"),
-                "first_cuda_s": _event_delta(events, "first_cuda_operation_start", "first_cuda_operation_done"),
-                "first_batch_at_s": _event_elapsed(events, "first_batch_retrieved"),
-                "first_step_s": _event_delta(events, "first_step_start", "first_forward_backward_optimizer_step_done"),
-                "first_report_at_s": _event_elapsed(events, "first_tune_report_start"),
-                "checkpoint_s": _event_delta(events, "checkpoint_write_start", "checkpoint_write_done"),
-                "final_restore_s": _event_delta(events, "final_checkpoint_restore_start", "final_checkpoint_restore_done"),
-                "ray_checkpoint_s": _event_delta(events, "ray_checkpoint_write_start", "ray_checkpoint_write_done"),
-                "hostname": _event_value(events, "runtime_context", "hostname"),
-                "pid": _event_value(events, "runtime_context", "pid"),
-                "cuda_visible_devices": _event_value(events, "runtime_context", "cuda_visible_devices"),
-                "ray_gpu_ids": _event_value(events, "runtime_context", "ray_gpu_ids"),
-                "omp_num_threads": _event_value(events, "runtime_context", "omp_num_threads"),
-                "mkl_num_threads": _event_value(events, "runtime_context", "mkl_num_threads"),
-                "torch_version": _event_value(events, "runtime_context", "torch_version"),
-                "torch_cuda_version": _event_value(events, "runtime_context", "torch_cuda_version"),
-                "torch_cuda_is_available": _event_value(events, "runtime_context", "torch_cuda_is_available"),
-                "torch_cuda_device_count": _event_value(events, "runtime_context", "torch_cuda_device_count"),
-            }
-        )
-    return rows
-
-
-def _event_elapsed(events: dict[str, dict[str, Any]], event: str) -> float | None:
-    value = events.get(event, {}).get("elapsed_s")
-    return float(value) if isinstance(value, int | float) else None
-
-
-def _event_delta(events: dict[str, dict[str, Any]], start: str, end: str) -> float | None:
-    start_s = _event_elapsed(events, start)
-    end_s = _event_elapsed(events, end)
-    if start_s is None or end_s is None:
-        return None
-    return end_s - start_s
-
-
-def _event_value(events: dict[str, dict[str, Any]], event: str, key: str) -> Any:
-    return events.get(event, {}).get(key, "")
-
-
-TIMING_COLUMNS = [
-    "trace",
-    "job_id",
-    "hostname",
-    "pid",
-    "cuda_visible_devices",
-    "ray_gpu_ids",
-    "omp_num_threads",
-    "mkl_num_threads",
-    "torch_version",
-    "torch_cuda_version",
-    "torch_cuda_is_available",
-    "torch_cuda_device_count",
-    "imports_s",
-    "dataset_s",
-    "dataloader_s",
-    "model_s",
-    "first_cuda_s",
-    "first_batch_at_s",
-    "first_step_s",
-    "first_report_at_s",
-    "checkpoint_s",
-    "final_restore_s",
-    "ray_checkpoint_s",
-]
-
-
-def format_timing_traces_csv(rows: list[dict[str, Any]]) -> str:
-    from io import StringIO
-
-    output = StringIO()
-    writer = csv.DictWriter(output, fieldnames=TIMING_COLUMNS)
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({column: "" if row.get(column) is None else row.get(column, "") for column in TIMING_COLUMNS})
-    return output.getvalue()
-
-
-def format_timing_traces_markdown(rows: list[dict[str, Any]]) -> str:
-    columns = [
-        "trace",
-        "gpu",
-        "imports",
-        "dataset",
-        "loader",
-        "model",
-        "cuda",
-        "first batch",
-        "first step",
-        "first report",
-        "checkpoint",
-    ]
-    table = ["| " + " | ".join(columns) + " |", "| " + " | ".join("---" for _ in columns) + " |"]
-    for row in rows:
-        values = [
-            Path(str(row.get("trace", ""))).name,
-            str(row.get("cuda_visible_devices", "")),
-            _format_seconds(row.get("imports_s")),
-            _format_seconds(row.get("dataset_s")),
-            _format_seconds(row.get("dataloader_s")),
-            _format_seconds(row.get("model_s")),
-            _format_seconds(row.get("first_cuda_s")),
-            _format_seconds(row.get("first_batch_at_s")),
-            _format_seconds(row.get("first_step_s")),
-            _format_seconds(row.get("first_report_at_s")),
-            _format_seconds(row.get("checkpoint_s")),
-        ]
-        table.append("| " + " | ".join(value.replace("|", "\\|") for value in values) + " |")
-    if not rows:
-        table.extend(["", "No trainable timing traces found."])
-    return "\n".join(table) + "\n"
-
-
-def _format_seconds(value: Any) -> str:
-    if not isinstance(value, int | float):
-        return ""
-    return f"{float(value):.3f}s"
-
-
 def _toml_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -422,23 +174,44 @@ def _toml_value(value: Any) -> str:
 def _toml_from_config(config: RunConfig) -> str:
     data = asdict(config) if is_dataclass(config) else config.to_dict()
     lines: list[str] = []
-    for section, values in data.items():
-        lines.append(f"[{section}]")
+
+    def emit_section(section: str, values: dict[str, Any]) -> None:
+        scalars: dict[str, Any] = {}
+        nested: dict[str, dict[str, Any]] = {}
         for key, value in values.items():
             if value is None:
                 continue
-            lines.append(f"{key} = {_toml_value(value)}")
-        lines.append("")
+            if isinstance(value, dict):
+                nested[key] = value
+            else:
+                scalars[key] = value
+        if scalars:
+            lines.append(f"[{section}]")
+            for key, value in scalars.items():
+                lines.append(f"{key} = {_toml_value(value)}")
+            lines.append("")
+        for key, value in nested.items():
+            emit_section(f"{section}.{key}", value)
+
+    for section, values in data.items():
+        if isinstance(values, dict):
+            emit_section(section, values)
+        else:
+            if values is None:
+                continue
+            lines.append(f"{section} = {_toml_value(values)}")
     return "\n".join(lines).rstrip() + "\n"
 
 
 def export_best_config(summary_path: str | Path, output_path: str | Path | None = None) -> Path:
     summary_file = Path(summary_path)
     summary = _read_json(summary_file)
-    config_arg = summary.get("config")
+    best_trial = summary.get("best_trial", {})
+    config_arg = best_trial.get("source_config") if isinstance(best_trial, dict) else None
+    if not isinstance(config_arg, str) or not config_arg:
+        config_arg = summary.get("config")
     if not isinstance(config_arg, str) or not config_arg:
         raise ValueError(f"{summary_file} does not contain a source config path.")
-    best_trial = summary.get("best_trial", {})
     best_overrides = best_trial.get("config", {}) if isinstance(best_trial, dict) else {}
     if not isinstance(best_overrides, dict):
         raise ValueError(f"{summary_file} does not contain best-trial config overrides.")

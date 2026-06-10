@@ -106,7 +106,7 @@ def run_doctor(*, expect_cuda: bool = False, check_inductor: bool = False, induc
     if check_inductor:
         import torch._dynamo
 
-        from .runner import _configure_torch_dynamo_for_compile
+        from .runner.optimization import _configure_torch_dynamo_for_compile
 
         _configure_torch_dynamo_for_compile()
         print(f"torch._dynamo.config.cache_size_limit: {torch._dynamo.config.cache_size_limit}")

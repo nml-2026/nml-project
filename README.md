@@ -4,209 +4,69 @@ Project repository for the EPFL EE-452 Network Machine Learning NBA trajectory f
 
 Given 8 observed time steps for 10 NBA players plus the ball, the code predicts the next 12 positions for all 11 entities. The pipeline covers data loading, train/validation/holdout splits, model training, local evaluation, Ray Tune searches, plotting, and Kaggle submission generation.
 
-## Repository Layout
+## Repository layout
 
 - `src/nba_forecasting/`: package code for data loading, models, training, evaluation, plotting, and submission generation
 - `configs/`: TOML experiment configs for baselines, graph models, and ablations
-- `docs/`: project notes for model families, paper-guided changes, and experiment planning
+- `docs/`: setup guides, model notes, and experiment planning
+- `cluster/`: Slurm scripts for SCITAS Izar
+- `scripts/`: model-comparison batch runs, Ray Tune sweeps, and result collection
 - `tests/`: smoke and regression tests
-- `cluster/`: starter scripts for running experiments on SCITAS Izar
 - `data/`: local dataset location
 - `runs/`: local training outputs, ignored by git
 - `artifacts/`: generated splits and cross-validation metadata, ignored by git
 
-## Setup
-
-Use [uv](https://docs.astral.sh/uv/) for local, Izar, and remote-GPU environments. uv manages Python and all Python dependencies.
+## Quick start
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-For Windows and other systems, see the [uv installation docs](https://docs.astral.sh/uv/getting-started/installation/).
-
-From the repository root, create and check an environment:
-
-```bash
 cd /path/to/nml-project
 uv sync --extra cpu
 source .venv/bin/activate
 python -m nba_forecasting doctor
+python -m nba_forecasting train --config baseline
 ```
 
-For development checks:
+Full local setup, data layout, and CLI examples: [docs/setup/local.md](docs/setup/local.md).
+
+## Documentation
+
+| Topic               | Guide                                                |
+| ------------------- | ---------------------------------------------------- |
+| Doc index           | [docs/README.md](docs/README.md)                     |
+| Codebase map        | [docs/architecture.md](docs/architecture.md)         |
+| Local setup         | [docs/setup/local.md](docs/setup/local.md)           |
+| Izar / Slurm        | [docs/setup/izar.md](docs/setup/izar.md)             |
+| Other GPU hosts     | [docs/setup/remote-gpu.md](docs/setup/remote-gpu.md) |
+| Curated experiments | [docs/experiments.md](docs/experiments.md)           |
+| Model families      | [docs/models.md](docs/models.md)                     |
+
+## Supported workflow
+
+The repository is curated for a single reproducible path:
+
+1. `prepare-data` to freeze the split and consolidated tensors
+2. `train` (single or batch) / `repeat-trials` / `cross-validate` for model training
+3. `evaluate` / `submit` / `ensemble-evaluate` / `ensemble-submit` for scoring and Kaggle export
+4. `tune` / `scripts/run_tune.sh` for hyperparameter sweeps; `model-comparison` for the report batch
+5. `summarize-results` and `export-best-config` for result review
+
+Curated configs, Tune scripts, and final candidates: [docs/experiments.md](docs/experiments.md).
+
+## Demo smoke test
+
+Quick check that the environment, tests, and CLI pipeline work (requires `data/`):
+
+```bash
+bash scripts/demo_smoke.sh
+```
+
+## Development checks
 
 ```bash
 uv sync --extra cpu --extra dev
-source .venv/bin/activate
-python -m pytest -q
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run ty check src
+uv run pytest
 ```
-
-Torch variants are selected by uv extras. The CUDA extras use explicit PyTorch wheel indexes in `pyproject.toml`:
-
-```bash
-uv sync --extra cu121
-uv sync --extra cu124
-uv sync --extra cu128
-source .venv/bin/activate
-python -m nba_forecasting doctor --expect-cuda
-```
-
-For SCITAS Izar setup and Slurm jobs, see [cluster/README.md](cluster/README.md). For remote GPU hosts, see [cluster/REMOTE_GPU.md](cluster/REMOTE_GPU.md).
-
-## Local Data
-
-Keep the Kaggle/NBA data under `data/`:
-
-```text
-data/
-  train.csv
-  test.csv
-  sample_submission.csv
-  train/*.pt
-  test/*.pt
-```
-
-The Kaggle-provided CSV files and tensor directories are intentionally ignored by git. Each team member should download or copy the dataset locally into this layout. Do not commit datasets, checkpoints, run outputs, credentials, or Kaggle tokens to this public repository.
-
-Each `.pt` sequence has shape `L x 11 x 4`, with features:
-
-```text
-[x, y, isplayer, team]
-```
-
-The first 8 time steps are the context window, and the target horizon is the next 12 time steps.
-
-Before syncing to Izar or another remote GPU host, prepare the portable dataset artifacts locally:
-
-```bash
-python -m nba_forecasting prepare-data
-```
-
-This creates:
-
-```text
-data/train_consolidated.pt
-data/test_consolidated.pt
-artifacts/splits/default_split.json
-```
-
-`default_split.json` is the frozen sequence-level train/validation/holdout split. It lives under `artifacts/` because it is generated from the local training sequence IDs, but it should be copied to every remote machine so all jobs reuse the same split.
-
-Remote sync instructions live in [cluster/README.md](cluster/README.md) for Izar and [cluster/REMOTE_GPU.md](cluster/REMOTE_GPU.md) for other GPU hosts.
-
-## Common Commands
-
-Train one experiment:
-
-```bash
-python -m nba_forecasting train --config e0_reference
-```
-
-Evaluate a checkpoint:
-
-```bash
-python -m nba_forecasting evaluate \
-  --checkpoint runs/e0_reference/<timestamp>/best.pt \
-  --split val
-```
-
-Generate a Kaggle submission:
-
-```bash
-python -m nba_forecasting submit \
-  --checkpoint runs/e3_dynamic_graph_direct/<timestamp>/best.pt \
-  --output submission.csv
-```
-
-Run a short smoke training job on real data:
-
-```bash
-python -m nba_forecasting train \
-  --config e3_dynamic_graph_direct \
-  --device auto \
-  --epochs 1 \
-  --set training.max_train_batches=6 \
-  --set training.max_val_batches=2
-```
-
-Run repeated trials or cross-validation:
-
-```bash
-python -m nba_forecasting repeat-trials \
-  --config e3_dynamic_graph_direct \
-  --repeats 3 \
-  --device auto
-
-python -m nba_forecasting cross-validate \
-  --config e3_dynamic_graph_direct \
-  --folds 5 \
-  --device cpu
-```
-
-Run Ray Tune with Optuna search:
-
-```bash
-python -m nba_forecasting tune \
-  --config e3_dynamic_graph_direct \
-  --device auto \
-  --search-profile graph \
-  --num-samples 12 \
-  --search-alg optuna \
-  --scheduler asha \
-  --max-concurrent-trials 1
-```
-
-Benchmarking commands live in [docs/benchmarking.md](docs/benchmarking.md).
-
-Rank Tune and batch results, then export the best trial config:
-
-```bash
-python -m nba_forecasting summarize-results \
-  --root /scratch/izar/$USER/nba_forecasting \
-  --format markdown \
-  --output results.md
-
-python -m nba_forecasting export-best-config \
-  --summary /scratch/izar/$USER/nba_forecasting/<jobid>/ray_tune/<config>/<timestamp>/ray_tune_summary.json \
-  --output configs/tuned_<config>.toml
-```
-
-## Experiment Starting Points
-
-- `e0_reference`: reference non-graph baseline
-- `e1_joint_gru`: stronger non-graph GRU baseline
-- `e1_joint_autoreg_gru`: autoregressive GRU baseline
-- `e1_social_ssm`: state-space baseline with social mixing
-- `e2_static_graph`: static graph model
-- `e2_static_graph_gat`: static graph model with attention message passing
-- `e3_dynamic_graph`: dynamic graph model
-- `e3_dynamic_graph_direct`: direct 12-step graph decoder
-- `e3_dynamic_graph_attention`: direct dynamic graph model with edge-aware attention message passing
-- `e3_dynamic_graph_mp_ssm`: direct dynamic graph model with an SSM-inspired message-passing layer
-- `e3_graph_ssm`: graph plus state-space-model blocks
-- `e3_graph_ssm_no_social`: graph plus state-space-model blocks without social SSM layers
-- `e5_graph_transformer`: graph-masked and edge-biased spatiotemporal Transformer candidate
-- `e5_graph_transformer_no_graph`, `e5_graph_transformer_shuffled_graph`: matched ablations for the graph Transformer
-- `e4_no_dynamic_edges`, `e4_no_semantic_flags`, `e4_no_velocity`: ablations
-
-Use `configs/base.toml` as the common configuration reference.
-Configs are full-run defaults. For quick tests, keep the same config name and pass runtime overrides such as `--epochs`, `training.max_train_batches`, and `training.max_val_batches`.
-Tune search profiles are `basic`, `graph`, `graph_fixed_message`, `graph_ssm`, and `graph_transformer`. Use `graph_fixed_message` when the config should keep its message-passing type fixed, such as an attention-only graph run. Use `--search-profile none` with explicit `--search PATH=EXPR` flags for fully custom searches.
-
-## Development Checks
-
-GitHub Actions runs linting, formatting checks, shell syntax checks, and tests on pull requests. Local pre-commit hooks are optional after installing the dev dependencies:
-
-```bash
-pre-commit install
-```
-
-## Workflow Notes
-
-- The pipeline freezes a sequence-level train/validation/holdout split and reuses it.
-- Metrics are reported in raw coordinate space, even when training uses normalized coordinates.
-- `--device auto` prefers CUDA, then MPS, then CPU.
-- Training outputs go under `runs/`.
-- Batch experiment summaries go under `runs/batches/`.
-- Cross-validation split metadata goes under `artifacts/cv/`.

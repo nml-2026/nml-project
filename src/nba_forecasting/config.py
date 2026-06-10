@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 try:  # Python 3.11+
-    import tomllib
+    import tomllib  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback for cluster envs
-    import tomli as tomllib
+    import tomli as tomllib  # type: ignore
 
 
 DEFAULT_CONTEXT_SIZE = 8
 DEFAULT_HORIZON_SIZE = 12
 DEFAULT_NUM_ENTITIES = 11
+
+
+def _filter_mapping(cls, data: dict[str, Any]) -> dict[str, Any]:
+    allowed = {item.name for item in fields(cls)}
+    return {key: value for key, value in data.items() if key in allowed}
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -39,7 +44,6 @@ def _load_raw_config(path: Path) -> dict[str, Any]:
 @dataclass(slots=True)
 class ExperimentSection:
     name: str
-    model_name: str
     seed: int = 0
     data_dir: str = "data"
     output_root: str = "runs"
@@ -52,59 +56,212 @@ class ExperimentSection:
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> ExperimentSection:
-        return cls(**data)
+        return cls(**_filter_mapping(cls, data))
 
 
 @dataclass(slots=True)
 class FeatureSection:
     use_velocity: bool = True
-    reflect_prob: float = 0.0  # probability of a y -> -y court mirror (left/right)
-    reflect_x_prob: float = 0.0  # probability of an x -> -x court mirror (attack-direction)
+    reflection: ReflectionSection = field(default_factory=lambda: ReflectionSection())
+    augmentation: AugmentationSection = field(default_factory=lambda: AugmentationSection())
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> FeatureSection:
-        return cls(**data)
+        reflection = data.get("reflection", {})
+        if not isinstance(reflection, ReflectionSection):
+            reflection = ReflectionSection.from_mapping(reflection)
+        augmentation = data.get("augmentation", {})
+        if not isinstance(augmentation, AugmentationSection):
+            augmentation = AugmentationSection.from_mapping(augmentation)
+        filtered = _filter_mapping(cls, data)
+        return cls(
+            use_velocity=filtered.get("use_velocity", True),
+            reflection=reflection,
+            augmentation=augmentation,
+        )
 
 
 @dataclass(slots=True)
-class ModelSection:
+class ReflectionSection:
+    y_prob: float = 0.0  # probability of a y -> -y court mirror (left/right)
+    x_prob: float = 0.0  # probability of an x -> -x court mirror (attack-direction)
+    mode: str = "random"  # random | expand
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> ReflectionSection:
+        return cls(**_filter_mapping(cls, data))
+
+
+@dataclass(slots=True)
+class AugmentationSection:
+    context_noise_std_ft: float = 0.0
+    context_frame_dropout_prob: float = 0.0
+    context_frame_dropout_mode: str = "previous"  # previous | zero_velocity
+    agent_permutation_prob: float = 0.0
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> AugmentationSection:
+        return cls(**_filter_mapping(cls, data))
+
+
+@dataclass(slots=True)
+class CommonModelSection:
     hidden_dim: int = 128
     message_dim: int = 128
     num_layers: int = 2
     dropout: float = 0.1
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> CommonModelSection:
+        return cls(**_filter_mapping(cls, data))
+
+
+@dataclass(slots=True)
+class GraphModelSection:
     k_neighbors: int = 3
     use_semantic_flags: bool = True
     dynamic_edges: bool = True
-    message_passing_type: str = "mpnn"
     separate_ball_head: bool = False
     use_relation_types: bool = False
     use_entity_embeddings: bool = False
     entity_embedding_dim: int = 16
     decoder_type: str = "autoregressive"
     direct_decoder_heads: int = 4
-    edge_radius: float | None = None
-    temporal_ssm_layers: int = 2
-    social_ssm_layers: int = 1
-    decoder_ssm_layers: int = 2
-    ssm_conv_kernel: int = 3
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> GraphModelSection:
+        return cls(**_filter_mapping(cls, data))
+
+
+@dataclass(slots=True)
+class GraphTransformerModelSection:
     transformer_heads: int = 4
     spatial_layers: int = 2
     temporal_layers: int = 2
     decoder_layers: int = 2
     transformer_ffn_multiplier: float = 2.0
     graph_ablation_mode: str = "normal"
-    optimization_backend: str = "compile"
-    graph_prep_backend: str = "torch"
-    graph_cache_backend: str = "baseline"
-    # Phase 7 (D1) mixture-density head. Defaults reproduce the deterministic delta head.
-    head_type: str = "delta"  # delta | mdn
-    mdn_components: int = 1  # K trajectory modes when head_type == "mdn"
-    mdn_point_estimate: str = "mean"  # mean (pi-weighted) | mode (argmax pi) for the point output
-    optimizer_backend: str = "adamw_fused"
+    num_virtual_nodes: int = 0
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> ModelSection:
-        return cls(**data)
+    def from_mapping(cls, data: dict[str, Any]) -> GraphTransformerModelSection:
+        return cls(**_filter_mapping(cls, data))
+
+
+@dataclass(slots=True)
+class ForecastHeadSection:
+    head_type: str = "delta"  # delta | mdn
+    mdn_components: int = 1  # K trajectory modes when head_type == "mdn"
+    mdn_point_estimate: str = "mean"  # mean | mode | medoid | student for the point output
+    oracle_student_head: bool = False
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> ForecastHeadSection:
+        return cls(**_filter_mapping(cls, data))
+
+
+@dataclass(slots=True)
+class MartModelSection:
+    mart_function_type: int = 2
+    mart_hyper_scale: int = 2
+    mart_decoder_hidden_dim: int = 128
+    mart_sample_k: int = 1
+    mart_point_aggregation: str = "mean"  # mean | learned_softmax | argmax | distribution_softmax | distribution_argmax
+    mart_decoder_variant: str = "direct"  # direct | type_conditioned
+    mart_mode_distribution: str = "none"  # none | gaussian
+    mart_mixture_min_log_sigma: float = -7.0
+    mart_mixture_max_log_sigma: float = 5.0
+    mart_distribution_detach_features: bool = False
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> MartModelSection:
+        return cls(**_filter_mapping(cls, data))
+
+
+@dataclass(slots=True)
+class BaselineModelConfig:
+    family: str = "baseline"
+    common: CommonModelSection = field(default_factory=CommonModelSection)
+
+
+@dataclass(slots=True)
+class DynamicGraphModelConfig:
+    family: str = "dynamic_graph_direct"
+    common: CommonModelSection = field(default_factory=CommonModelSection)
+    graph: GraphModelSection = field(default_factory=GraphModelSection)
+
+
+@dataclass(slots=True)
+class GraphTransformerModelConfig:
+    family: str = "graph_transformer"
+    common: CommonModelSection = field(default_factory=CommonModelSection)
+    graph: GraphModelSection = field(default_factory=GraphModelSection)
+    graph_transformer: GraphTransformerModelSection = field(default_factory=GraphTransformerModelSection)
+    head: ForecastHeadSection = field(default_factory=ForecastHeadSection)
+
+
+@dataclass(slots=True)
+class MartModelConfig:
+    family: str = "mart_hypergraph"
+    common: CommonModelSection = field(default_factory=CommonModelSection)
+    graph_transformer: GraphTransformerModelSection = field(default_factory=GraphTransformerModelSection)
+    mart: MartModelSection = field(default_factory=MartModelSection)
+
+
+ModelConfig = BaselineModelConfig | DynamicGraphModelConfig | GraphTransformerModelConfig | MartModelConfig
+
+_MODEL_FAMILY_ALIASES = {
+    "baseline": "baseline",
+    "joint_gru": "joint_gru",
+    "static_graph": "static_graph",
+    "dynamic_graph_direct": "dynamic_graph_direct",
+    "dynamic_graph_autoregressive": "dynamic_graph_autoregressive",
+    "graph_transformer": "graph_transformer",
+    "mart_hypergraph": "mart_hypergraph",
+}
+
+
+def parse_model_config(data: dict[str, Any]) -> ModelConfig:
+    if "family" not in data:
+        raise KeyError("Missing required model.family.")
+    raw_family = str(data["family"])
+    if raw_family not in _MODEL_FAMILY_ALIASES:
+        raise KeyError(f"Unknown model.family {raw_family!r}.")
+    family = _MODEL_FAMILY_ALIASES[raw_family]
+    common = CommonModelSection.from_mapping(data.get("common", {}))
+    if family in {"baseline", "joint_gru"}:
+        return BaselineModelConfig(family=family, common=common)
+    if family in {"dynamic_graph_direct", "static_graph", "dynamic_graph_autoregressive"}:
+        return DynamicGraphModelConfig(
+            family=family,
+            common=common,
+            graph=GraphModelSection.from_mapping(data.get("graph", {})),
+        )
+    if family == "graph_transformer":
+        return GraphTransformerModelConfig(
+            family=family,
+            common=common,
+            graph=GraphModelSection.from_mapping(data.get("graph", {})),
+            graph_transformer=GraphTransformerModelSection.from_mapping(data.get("graph_transformer", {})),
+            head=ForecastHeadSection.from_mapping(data.get("head", {})),
+        )
+    return MartModelConfig(
+        family=family,
+        common=common,
+        graph_transformer=GraphTransformerModelSection.from_mapping(data.get("graph_transformer", {})),
+        mart=MartModelSection.from_mapping(data.get("mart", {})),
+    )
+
+
+@dataclass(slots=True)
+class RuntimeSection:
+    optimization_backend: str = "compile"
+    optimizer_backend: str = "adamw_fused"
+    mixed_precision: bool = True
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> RuntimeSection:
+        return cls(**_filter_mapping(cls, data))
 
 
 @dataclass(slots=True)
@@ -117,7 +274,7 @@ class TrainingSection:
     lr_milestones: list[int] = field(default_factory=list)
     lr_gamma: float = 0.1
     grad_clip: float = 1.0
-    num_workers: int = 0
+    num_workers: int = -1
     patience: int = 8
     log_every: int = 50
     teacher_forcing_prob: float = 0.0
@@ -131,11 +288,10 @@ class TrainingSection:
     max_val_batches: int | None = None
     train_window_sampling: str = "all_windows"
     val_window_sampling: str = "all_windows"
-    mixed_precision: bool = True
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> TrainingSection:
-        return cls(**data)
+        return cls(**_filter_mapping(cls, data))
 
 
 @dataclass(slots=True)
@@ -148,26 +304,42 @@ class LossSection:
     court_y_half: float = 25.0  # half court width (ft)
     boundary_margin: float = 2.0  # ft of slack before the boundary hinge engages
     ball_max_dist: float = 8.0  # ft; hinge engages when nearest player is farther (~p99)
+    sample_loss_type: str = "hard_min_ade"  # hard_min_ade | softmin_ade | mixture_nll
+    sample_loss_space: str = "normalized"  # normalized | raw
+    raw_loss_scale_ft: float = 0.0  # <=0 auto-scales raw ADE/MSE terms by normalizer sigma
+    softmin_temperature: float = 1.0
+    point_loss_weight: float = 0.0
+    point_loss_start_epoch: int = 1
+    point_loss_warmup_epochs: int = 0
+    mixture_nll_weight: float = 0.0
+    mixture_nll_start_epoch: int = 1
+    mixture_nll_warmup_epochs: int = 0
+    mixture_nll_detach_means: bool = False
+    oracle_student_loss_weight: float = 0.0
+    oracle_student_start_epoch: int = 5
+    oracle_student_warmup_epochs: int = 10
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> LossSection:
-        return cls(**data)
+        return cls(**_filter_mapping(cls, data))
 
 
 @dataclass(slots=True)
 class EvaluationSection:
     num_examples: int = 3
+    tta_group: str = "none"  # none | y | x | xy
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> EvaluationSection:
-        return cls(**data)
+        return cls(**_filter_mapping(cls, data))
 
 
 @dataclass(slots=True)
 class RunConfig:
     experiment: ExperimentSection
     features: FeatureSection = field(default_factory=FeatureSection)
-    model: ModelSection = field(default_factory=ModelSection)
+    model: ModelConfig = field(default_factory=BaselineModelConfig)
+    runtime: RuntimeSection = field(default_factory=RuntimeSection)
     training: TrainingSection = field(default_factory=TrainingSection)
     loss: LossSection = field(default_factory=LossSection)
     evaluation: EvaluationSection = field(default_factory=EvaluationSection)
@@ -178,10 +350,21 @@ class RunConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RunConfig:
+        if "model_name" in data.get("experiment", {}):
+            raise KeyError("experiment.model_name was removed. Use [model].family.")
+        if "model" not in data:
+            raise KeyError("Missing required [model] section.")
         return cls(
             experiment=ExperimentSection.from_mapping(data["experiment"]),
-            features=FeatureSection.from_mapping(data.get("features", {})),
-            model=ModelSection.from_mapping(data.get("model", {})),
+            features=FeatureSection.from_mapping(
+                {
+                    **{k: v for k, v in data.get("features", {}).items() if k not in {"reflection", "augmentation"}},
+                    "reflection": ReflectionSection.from_mapping(data.get("features", {}).get("reflection", {})),
+                    "augmentation": AugmentationSection.from_mapping(data.get("features", {}).get("augmentation", {})),
+                }
+            ),
+            model=parse_model_config(data.get("model", {})),
+            runtime=RuntimeSection.from_mapping(data.get("runtime", {})),
             training=TrainingSection.from_mapping(data.get("training", {})),
             loss=LossSection.from_mapping(data.get("loss", {})),
             evaluation=EvaluationSection.from_mapping(data.get("evaluation", {})),
@@ -210,13 +393,18 @@ def resolve_config_path(config_arg: str | Path) -> Path:
 def load_config(config_arg: str | Path) -> tuple[RunConfig, Path]:
     path = resolve_config_path(config_arg)
     raw = _load_raw_config(path)
-    return RunConfig.from_dict(raw), path
+    config = RunConfig.from_dict(raw)
+    from .models.builders import validate_loss_config
+
+    validate_loss_config(config)
+    return config, path
 
 
 def project_root_for_config(config_path: str | Path) -> Path:
     path = Path(config_path).resolve()
-    if path.parent.name == "configs":
-        return path.parent.parent
+    for parent in path.parents:
+        if parent.name == "configs":
+            return parent.parent
     return path.parent
 
 
@@ -269,5 +457,7 @@ def apply_overrides(config: RunConfig, overrides: dict[str, Any]) -> RunConfig:
         leaf = parts[-1]
         if leaf not in target:
             raise KeyError(f"Unknown override path {path!r}.")
+        if value is None and isinstance(target[leaf], str):
+            value = "none"
         target[leaf] = value
     return RunConfig.from_dict(data)
