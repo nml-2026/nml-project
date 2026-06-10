@@ -13,7 +13,7 @@ PUBLICATION_SCRIPTS = frozenset(
     {
         "run_tune.sh",
         "collect_results.py",
-        "demo_smoke.sh",
+        "demo.sh",
     }
 )
 

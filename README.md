@@ -58,7 +58,7 @@ Curated configs, Tune scripts, and final candidates: [docs/experiments.md](docs/
 Quick check that the environment, tests, and CLI pipeline work (requires `data/`):
 
 ```bash
-bash scripts/demo_smoke.sh
+bash scripts/demo.sh
 ```
 
 ## Development checks

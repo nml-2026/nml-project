@@ -32,7 +32,7 @@ All runnable configs inherit shared defaults from `base.toml`:
 | --- | --- |
 | `run_tune.sh` | Ray Tune sweeps for graph Transformer and MART |
 | `collect_results.py` | Aggregate metrics and print report-table numbers |
-| `demo_smoke.sh` | Doctor + pytest + 1-epoch train (requires `data/`) |
+| `demo.sh` | Doctor + prepare-data + 5-epoch bounded train (requires `data/`) |
 
 Model-comparison training uses the CLI (`model-comparison` subcommand). Everything else uses `train`, `evaluate`, `submit`, etc. directly.
 

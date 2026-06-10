@@ -102,7 +102,7 @@ Override precedence: base → `extends` chain → CLI `--set` / `--epochs` / etc
 | Hyperparameter search | `bash scripts/run_tune.sh` or `tune` CLI |
 | Aggregate metrics | `python3 scripts/collect_results.py` |
 | Quick health check | `python -m nba_forecasting doctor` |
-| Demo / CI smoke | `bash scripts/demo_smoke.sh` |
+| Demo / CI smoke | `bash scripts/demo.sh` |
 
 ## Tests
 

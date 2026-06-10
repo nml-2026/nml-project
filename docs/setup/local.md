@@ -168,7 +168,7 @@ NBA_TRAINING_SLOTS=4 python -m nba_forecasting train --config graph_transformer
 For a quick end-to-end check (requires `data/`):
 
 ```bash
-bash scripts/demo_smoke.sh
+bash scripts/demo.sh
 ```
 
 ## Development checks

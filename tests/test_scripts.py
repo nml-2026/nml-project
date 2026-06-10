@@ -13,8 +13,8 @@ def test_publication_scripts_exist() -> None:
     assert missing == []
 
 
-def test_demo_smoke_script_exists() -> None:
-    script = Path(__file__).parents[1] / "scripts" / "demo_smoke.sh"
+def test_demo_script_exists() -> None:
+    script = Path(__file__).parents[1] / "scripts" / "demo.sh"
     source = script.read_text()
     assert script.is_file()
     assert source.startswith("#!/usr/bin/env bash")
