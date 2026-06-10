@@ -95,12 +95,23 @@ What we implemented or chose for the NBA benchmark:
 | --- | --- |
 | **Pipeline** | `FamilySpec` registration, `mart.toml` / `tune_mart.toml`, shared data loaders, augmentations, trainer, checkpointing, xy TTA evaluation, and Kaggle submission |
 | **Input adapter** | Map NBA tensors `[x, y, (vx, vy), isplayer, team]` into MART's expected layout |
-| **Decoder variant** | `mart_decoder_variant = "type_conditioned"` — separate ball/player bias on top of the ported multi-mode head |
-| **Inference aggregation** | `mart_point_aggregation = "learned_softmax"` — learned weights over the $K{=}20$ modes at eval/submit time |
-| **Training loss** | `loss.sample_loss_type = "softmin_ade"` with `loss.sample_loss_space = "raw"` (**softmin-raw**): temperature-weighted minADE in denormalized court coordinates, with tuned `softmin_temperature` and `raw_loss_scale_ft` |
+| **Decoder variant** | `mart_decoder_variant = "type_conditioned"` (see [training recipe](#mart-training-recipe)) |
+| **Inference aggregation** | `mart_point_aggregation = "learned_softmax"` (see [training recipe](#mart-training-recipe)) |
+| **Training loss** | softmin-raw multi-mode loss (see [training recipe](#mart-training-recipe)) |
 | **Hyperparameters** | Ray Tune sweep (`tune_mart.toml`, `scripts/run_tune.sh`) merged into `mart.toml` (lr, schedule, width, `mart_function_type`, etc.) |
-| **Protocol** | Same frozen split as other families; report-table `mart` uses reflect xy and agent permutation ($p{=}0.5$ each, `base.toml`); 100 epochs because validation was still improving at 80 |
+| **Protocol** | Same frozen split as other families; report-table `mart` uses the default train-time augmentations in `base.toml` (see [Train-time augmentations](architecture.md#train-time-augmentations)); 100 epochs because validation was still improving at 80 |
 | **Aug ablations** | `mart_aug_none`, `mart_aug_reflect`, `mart_aug_perm` isolate train-time reflection vs.\ agent permutation (see [experiments.md](experiments.md#mart-augmentation-ablations)) |
+
+#### Training recipe {#mart-training-recipe}
+
+Report-table `mart` (`mart.toml`) uses $K{=}20$ trajectory modes from the ported decoder. Training and inference treat those modes differently:
+
+- **$K{=}20$ modes** — the decoder head predicts 20 candidate future trajectories per entity. Training optimizes over all modes; evaluation collapses them to a single point forecast.
+- **Type-conditioned decoder** (`mart_decoder_variant = "type_conditioned"`) — shared multi-mode weights plus a learned ball/player offset on the final horizon positions. The ball slot (identified by `isplayer = 0`) keeps its own bias; players share the other.
+- **Learned-softmax aggregation** (`mart_point_aggregation = "learned_softmax"`) — at eval and submit time, a linear scorer assigns softmax weights over the 20 modes and returns their weighted average as the point forecast (not a plain mean or argmax).
+- **Softmin-raw loss** — `loss.sample_loss_type = "softmin_ade"` with `loss.sample_loss_space = "raw"`. *Softmin* is a differentiable surrogate for minADE: per-mode ADE values get temperature-weighted softmax weights that favor low-error modes (`softmin_ade_loss` in `metrics.py`). *Raw* means the loss runs in denormalized court feet before dividing by the tuned scale `raw_loss_scale_ft` (`runner/recipe.py`).
+
+One-sentence summary for the report: we compare against the published MART hypergraph under our shared protocol, using its 20-mode decoder with a tuned recipe (softmin minADE in feet, ball/player decoder offsets, and learned mode weighting at inference).
 
 Optional knobs we added on top of the port (not used in the report table): Gaussian per-mode distributions (`mart_mode_distribution = "gaussian"`), alternate aggregations (`mean`, `argmax`, `distribution_*`), and additional loss modes wired through `resolve_training_loss_policy`.
 

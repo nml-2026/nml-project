@@ -23,7 +23,7 @@ Supported configs, the model-comparison CLI, and Ray Tune sweeps.
 All runnable configs inherit shared defaults from `base.toml`:
 
 - `features.reflection`: $x$ and $y$ mirrors, each with probability $0.5$
-- `features.augmentation.agent_permutation_prob = 0.5`
+- `features.augmentation.agent_permutation_prob = 0.5` — shuffles player slots per training window; ball index fixed (see [Train-time augmentations](architecture.md#train-time-augmentations))
 - Training without TTA; model-comparison evaluates xy TTA explicitly after training
 
 ## Scripts
@@ -83,7 +83,7 @@ Writes `report/generated/model_comparison.{md,tex}` and prints holdout+xy-TTA nu
 
 ## MART augmentation ablations
 
-Optional model-comparison jobs for Table~3 in the report. Same softmin-raw recipe and 100-epoch budget as `mart`; only train-time augmentation differs.
+Optional model-comparison jobs for Table~3 in the report. Same [softmin-raw training recipe](models.md#mart-training-recipe) and 100-epoch budget as `mart`; only train-time augmentation differs. Reflection and agent permutation are documented in [Train-time augmentations](architecture.md#train-time-augmentations).
 
 | Config | Reflection ($x$, $y$ each $p{=}0.5$) | Agent permutation |
 | --- | ---: | ---: |
@@ -120,7 +120,7 @@ python -m nba_forecasting submit --checkpoint runs/.../best.pt --output submissi
 
 ## MART scope
 
-MART rows in the model-comparison table compare against the published hypergraph architecture ([arXiv:2407.21635](https://arxiv.org/abs/2407.21635)), not a model we designed. Our contribution is the **integration and training recipe**: NBA feature adapter, softmin-raw multi-mode loss, type-conditioned decoder, learned-softmax mode aggregation, Ray Tune hyperparameters in `mart.toml`, and evaluation under the shared protocol above. See [models.md](models.md#mart) for the full split between prior work and our changes.
+MART rows in the model-comparison table compare against the published hypergraph architecture ([arXiv:2407.21635](https://arxiv.org/abs/2407.21635)), not a model we designed. Our contribution is the **integration and training recipe**: NBA feature adapter, softmin-raw multi-mode loss, type-conditioned decoder, learned-softmax mode aggregation, Ray Tune hyperparameters in `mart.toml`, and evaluation under the shared protocol above. See [models.md § MART](models.md#mart) for the prior-work split and [training recipe](models.md#mart-training-recipe) for term definitions.
 
 ## Ray Tune
 

@@ -12,6 +12,6 @@
 
 | Guide                              | Contents                                        |
 | ---------------------------------- | ----------------------------------------------- |
-| [architecture.md](architecture.md) | Codebase layout, modules, data flow             |
+| [architecture.md](architecture.md) | Codebase layout, modules, data flow, train-time augmentations |
 | [experiments.md](experiments.md)   | Configs, model-comparison batch, Ray Tune       |
 | [models.md](models.md)             | Supported model families and inputs             |
