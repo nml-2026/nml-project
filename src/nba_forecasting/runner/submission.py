@@ -79,7 +79,7 @@ def submit_ensemble(
 ) -> Path:
     device = resolve_device(device_arg)
     print("Using device:", device)
-    models, config, _ = _load_ensemble(checkpoints, device)
+    models, config, _, _ = _load_ensemble(checkpoints, device)
     if data_dir is not None:
         config.experiment.data_dir = str(Path(data_dir).resolve())
     use_velocity = config.features.use_velocity
