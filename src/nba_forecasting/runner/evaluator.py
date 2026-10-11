@@ -234,6 +234,56 @@ def _compute_mixture_metrics(
     }
 
 
+def _compute_ensemble_mixture_metrics(
+    models_with_normalizers: list[tuple[torch.nn.Module, Normalizer]],
+    dataloader: DataLoader,
+    device: torch.device,
+) -> dict[str, float]:
+    """Pooled-mode ensemble minADE_K / minFDE_K (feet) for an all-MDN ensemble, eval-only.
+
+    Each leg contributes its ``K`` single-forward mixture modes (no TTA: reflection averaging
+    has no canonical mode ordering, mirroring ``_compute_mixture_metrics``). Per leg the modes
+    are denormalized with THAT leg's own normalizer (the raw-space convention of
+    ``_ensemble_predict_raw``), then concatenated along the component axis into ``K * Nseeds``
+    pooled hypotheses before the oracle min over modes. The pooled set is strictly larger, so
+    minADE_K cannot rise vs a single leg -- this is an oracle metric over a bigger candidate
+    set, not a like-for-like single-model comparison. ``mdn_components`` reports the pooled mode
+    count. N=1 reduces to ``_compute_mixture_metrics``.
+    """
+    for model, _ in models_with_normalizers:
+        model.eval()
+    total_ade = 0.0
+    total_fde = 0.0
+    pooled_modes = 0
+    examples = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            context = batch["context"].to(device)
+            per_leg_modes: list[torch.Tensor] = []
+            for model, normalizer in models_with_normalizers:
+                output = forecast_model(model, context, mdn_point_estimate="mean")
+                params = output.distribution
+                assert params is not None
+                batch_size, horizon, num_entities, num_components, _ = params.means.shape
+                modes_flat = params.means.reshape(batch_size, horizon, num_entities * num_components, 2)
+                modes_raw = _denormalize_predictions(modes_flat, normalizer).reshape(
+                    batch_size, horizon, num_entities, num_components, 2
+                )
+                per_leg_modes.append(modes_raw)
+            pooled = torch.cat(per_leg_modes, dim=3)  # [B, T, N, K * Nseeds, 2]
+            pooled_modes = pooled.shape[3]
+            target_raw = batch["future_xy_raw"].to(device)
+            total_ade += float(min_ade_k(pooled, target_raw)) * context.shape[0]
+            total_fde += float(min_fde_k(pooled, target_raw)) * context.shape[0]
+            examples += context.shape[0]
+    divisor = max(examples, 1)
+    return {
+        "min_ade_k": total_ade / divisor,
+        "min_fde_k": total_fde / divisor,
+        "mdn_components": float(pooled_modes),
+    }
+
+
 def evaluate_checkpoint(
     checkpoint_path: str | Path,
     split_name: str,
@@ -336,11 +386,17 @@ def _normalize_predictions(prediction_raw: torch.Tensor, normalizer: Normalizer)
 def _load_ensemble(
     checkpoint_paths: list[str | Path],
     device: torch.device,
-) -> tuple[list[tuple[torch.nn.Module, Normalizer]], RunConfig, dict]:
+) -> tuple[list[tuple[torch.nn.Module, Normalizer]], RunConfig, dict, list[bool]]:
+    """Returns ``[(model, normalizer), ...]``, the first checkpoint's ``(config, checkpoint)``
+    (callers use it to build the dataloader / resolve the frozen split -- all legs share it),
+    and the per-leg mixture-distribution flag (so the caller can gate the all-MDN pooled
+    minADE_K pass).
+    """
     paths = list(checkpoint_paths)
     if not paths:
         raise ValueError("Ensemble requires at least one checkpoint path.")
     models: list[tuple[torch.nn.Module, Normalizer]] = []
+    has_mixture: list[bool] = []
     base_config: RunConfig | None = None
     base_checkpoint: dict | None = None
     base_shape: tuple[int, int] | None = None
@@ -354,8 +410,9 @@ def _load_ensemble(
                 f"Ensemble member {str(path)!r} has (horizon, entities)={shape}, incompatible with the first member's {base_shape}."
             )
         models.append((model, normalizer))
+        has_mixture.append(has_mixture_distribution(config))
     assert base_config is not None and base_checkpoint is not None
-    return models, base_config, base_checkpoint
+    return models, base_config, base_checkpoint, has_mixture
 
 
 def _ensemble_predict_raw(
@@ -406,7 +463,7 @@ def evaluate_ensemble(
 ) -> Path:
     device = resolve_device(device_arg)
     print("Using device:", device)
-    models, config, checkpoint = _load_ensemble(checkpoints, device)
+    models, config, checkpoint, has_mixture = _load_ensemble(checkpoints, device)
     if data_dir is not None:
         config.experiment.data_dir = str(Path(data_dir).resolve())
     use_velocity = config.features.use_velocity
@@ -431,6 +488,8 @@ def evaluate_ensemble(
     averaged["tta_group"] = tta_group
     averaged["ensemble_n"] = len(models)
     averaged["checkpoints"] = [str(Path(p).resolve()) for p in checkpoints]
+    if all(has_mixture):
+        averaged.update(_compute_ensemble_mixture_metrics(models, dataloader, device))
     suffix = f"_tta_{tta_group}" if tta_group != "none" else ""
     if output_dir:
         base_dir = Path(output_dir)
